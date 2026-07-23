@@ -257,7 +257,7 @@ if page == "Explore projects":
         f"Source batch: {project['source_batch']} · Updated: {project['updated_at']}"
     )
     selected_metric_1, selected_metric_2, selected_metric_3 = st.columns(3)
-    selected_metric_1.metric("Total funding", funding_display(project["funding_amount"]))
+    selected_metric_1.metric("Selected project funding", funding_display(project["funding_amount"]))
     selected_metric_2.metric("Academic year", project["academic_year"] or "—")
     selected_metric_3.metric("Category", project["category"] or "—")
 

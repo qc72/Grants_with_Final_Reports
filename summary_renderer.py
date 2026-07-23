@@ -436,6 +436,142 @@ def load_summary(text: str, docx_path: Path | None = None) -> SummaryData:
     return fallback
 
 
+
+def _dedupe_repeated_text(value: str) -> str:
+    """Remove accidental duplicated words, sentences, or full repeated halves.
+
+    Flattened DOCX text can occasionally repeat a status or the entire brief
+    explanation. This cleanup is deliberately conservative: it only removes
+    exact adjacent repetitions after whitespace/punctuation normalization.
+    """
+    value = _clean(value)
+    if not value:
+        return ""
+
+    # Remove exact repeated halves at the word level.
+    words = value.split()
+    if len(words) >= 2 and len(words) % 2 == 0:
+        half = len(words) // 2
+        if [w.casefold() for w in words[:half]] == [w.casefold() for w in words[half:]]:
+            value = " ".join(words[:half])
+
+    # Remove consecutive duplicate sentences while preserving punctuation.
+    sentences = re.split(r"(?<=[.!?])\s+", value)
+    deduped: list[str] = []
+    for sentence in sentences:
+        if not sentence:
+            continue
+        if deduped and _norm(deduped[-1]) == _norm(sentence):
+            continue
+        deduped.append(sentence)
+    value = " ".join(deduped)
+
+    # Remove consecutive duplicate single tokens, e.g. "Uncertain Uncertain".
+    words = value.split()
+    compact: list[str] = []
+    for word in words:
+        if compact and _norm(compact[-1]) == _norm(word) and len(_norm(word)) > 1:
+            continue
+        compact.append(word)
+    return _clean(" ".join(compact))
+
+
+def _strip_status_prefix(reasoning: str, status: str) -> str:
+    """Remove one or more leading copies of the row status from reasoning."""
+    reasoning = _clean(reasoning)
+    status = _clean(status)
+    if not reasoning or not status:
+        return reasoning
+
+    status_norm = _norm(status)
+    while reasoning:
+        match = STATUS_PATTERN.match(reasoning)
+        if not match or _norm(match.group(1)) != status_norm:
+            break
+        remainder = _clean(match.group(2))
+        if remainder == reasoning:
+            break
+        reasoning = remainder
+    return reasoning
+
+
+def _prepare_assessment_rows(
+    rows: list[tuple[str, str, str]],
+    notes: list[tuple[str, str]],
+) -> tuple[list[tuple[str, str, str]], list[tuple[str, str]]]:
+    """Repair common flattened-table errors before rendering.
+
+    In some stored summaries the first column is accidentally copied into the
+    second column, while the actual result is prefixed to the explanation. This
+    function restores Criterion / Result / Reasoning and folds a standalone
+    brief explanation into the overall-classification row.
+    """
+    brief_explanation = ""
+    remaining_notes: list[tuple[str, str]] = []
+    for label, value in notes:
+        cleaned_value = _dedupe_repeated_text(value)
+        if _norm(label) in {"brief explanation", "assessment note", "summary explanation", "reasoning"}:
+            if cleaned_value and not brief_explanation:
+                brief_explanation = cleaned_value
+        else:
+            remaining_notes.append((_clean(label), cleaned_value))
+
+    prepared: list[tuple[str, str, str]] = []
+    overall_index: int | None = None
+
+    for criterion, result, reasoning in rows:
+        criterion = _clean(criterion)
+        result = _clean(result)
+        reasoning = _dedupe_repeated_text(reasoning)
+        criterion_norm = _norm(criterion)
+
+        # Repair: Result accidentally repeats Criterion, while Reasoning starts
+        # with the actual status (e.g. "Unclear Project notes ...").
+        if result and _norm(result) == criterion_norm:
+            recovered_status, recovered_reasoning = _split_status_reasoning(reasoning)
+            if recovered_status:
+                result = recovered_status
+                reasoning = recovered_reasoning
+            else:
+                result = ""
+
+        # Repair a combined result cell such as "Yes Addresses ...".
+        if result and not reasoning:
+            recovered_status, recovered_reasoning = _split_status_reasoning(result)
+            if recovered_status and recovered_reasoning:
+                result = recovered_status
+                reasoning = recovered_reasoning
+
+        # Repair a blank or invalid result from a reasoning prefix.
+        valid_status, recovered_reasoning = _split_status_reasoning(reasoning)
+        if valid_status and (not result or _norm(result) == criterion_norm):
+            result = valid_status
+            reasoning = recovered_reasoning
+
+        reasoning = _strip_status_prefix(reasoning, result)
+        reasoning = _dedupe_repeated_text(reasoning)
+
+        # A reasoning cell containing only the status conveys no explanation.
+        if reasoning and _norm(reasoning) == _norm(result):
+            reasoning = ""
+
+        if criterion_norm in {"overall classification", "overall cel classification", "overall ces classification"}:
+            overall_index = len(prepared)
+
+        prepared.append((criterion, result or "—", reasoning or "—"))
+
+    # Prefer the standalone brief explanation when the overall row lacks a
+    # meaningful third-column explanation. Do not render it again below.
+    if brief_explanation:
+        if overall_index is not None:
+            criterion, result, reasoning = prepared[overall_index]
+            if reasoning == "—" or _norm(reasoning) in {_norm(result), "uncertain", "unclear", "cel", "not cel"}:
+                prepared[overall_index] = (criterion, result, brief_explanation)
+        else:
+            remaining_notes.append(("Brief explanation", brief_explanation))
+
+    return prepared, remaining_notes
+
 def _styles() -> None:
     st.markdown(
         """
@@ -521,10 +657,12 @@ def render_summary(text: str, docx_path: Path | None = None) -> None:
     st.divider()
 
     st.markdown("### 3. CES evidence assessment")
-    # Every displayed assessment row always has a third reasoning column.
-    assessment_rows = [(criterion, result, reasoning or "—") for criterion, result, reasoning in data.assessment]
+    # Normalize malformed legacy/flattened rows immediately before display.
+    assessment_rows, assessment_notes = _prepare_assessment_rows(
+        data.assessment, data.assessment_notes
+    )
     _table(assessment_rows, ("Criterion", "Result", "Reasoning"), "ces")
-    for label, value in data.assessment_notes:
+    for label, value in assessment_notes:
         st.info(f"{label}: {value}")
     st.divider()
 

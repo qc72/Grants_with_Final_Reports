@@ -103,3 +103,42 @@ def test_summary_detection_works_with_uuid_filename(tmp_path: Path):
     assert summary_document_score(path) >= 20
     data = parse_docx_summary(path)
     assert data.assessment[0][2] == "Demonstrated by partner requests."
+
+
+def test_repairs_duplicated_criterion_and_brief_explanation():
+    from summary_renderer import _prepare_assessment_rows
+
+    repeated = (
+        "Meets community-need and learning-integration criteria, but lack of a "
+        "formal, reciprocal partner and limited finished public outputs leave "
+        "reciprocity and impact ambiguous."
+    )
+    rows = [
+        (
+            "Reciprocity with partners",
+            "Reciprocity with partners",
+            "Unclear Project notes no formal community partner; interactions appear ad hoc.",
+        ),
+        (
+            "Community need",
+            "Community need",
+            "Yes Addresses locally identified demand for low-carbon heating alternatives.",
+        ),
+        ("Overall classification", "Uncertain", "Uncertain Uncertain"),
+    ]
+    prepared, notes = _prepare_assessment_rows(
+        rows, [("Brief explanation", f"{repeated} {repeated}")]
+    )
+
+    assert prepared[0] == (
+        "Reciprocity with partners",
+        "Unclear",
+        "Project notes no formal community partner; interactions appear ad hoc.",
+    )
+    assert prepared[1] == (
+        "Community need",
+        "Yes",
+        "Addresses locally identified demand for low-carbon heating alternatives.",
+    )
+    assert prepared[2] == ("Overall classification", "Uncertain", repeated)
+    assert notes == []
