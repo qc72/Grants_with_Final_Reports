@@ -114,8 +114,19 @@ def read_text(path: Path) -> str:
     return path.read_text(errors="replace")
 
 
+def _paragraph_has_numbering(paragraph: Paragraph) -> bool:
+    properties = paragraph._p.pPr
+    return bool(properties is not None and properties.numPr is not None)
+
+
 def read_docx(path: Path) -> str:
-    """Read paragraphs and tables in their original DOCX order."""
+    """Read paragraphs and tables in original order, retaining list semantics.
+
+    Summary files are not perfectly templated. Some headings omit periods, some
+    tables start with ``Item`` rather than ``Field``, and Word list numbers are
+    formatting rather than paragraph text. A visible bullet marker gives the
+    renderer enough information to preserve lists without relying on styles.
+    """
     doc = Document(path)
     chunks: list[str] = []
 
@@ -123,8 +134,11 @@ def read_docx(path: Path) -> str:
         if isinstance(child, CT_P):
             paragraph = Paragraph(child, doc)
             text = paragraph.text.strip()
-            if text:
-                chunks.append(text)
+            if not text or text.casefold() in {"top of form", "bottom of form"}:
+                continue
+            if _paragraph_has_numbering(paragraph):
+                text = f"• {text}"
+            chunks.append(text)
         elif isinstance(child, CT_Tbl):
             table = Table(child, doc)
             for row in table.rows:

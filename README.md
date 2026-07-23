@@ -125,3 +125,7 @@ Generated summary DOCX files are displayed as structured content rather than raw
 - Missing-information bullets
 
 The app safely escapes summary text, so dollar signs, backticks, indentation, and other Markdown-like characters do not change the display. New imports also preserve the original order of DOCX paragraphs and tables. Existing database records are supported by the renderer without requiring a full database reset; re-importing a batch refreshes the stored summary text using the improved DOCX parser.
+
+## Summary template tolerance
+
+The summary viewer recognizes minor DOCX variations, including numbered headings with or without periods, `Field` or `Item` table headers, `Quote` or `Quotes`, `Source` or `Source file`, Word bullets, and databases created by older importer versions that appended tables after the paragraph text.
