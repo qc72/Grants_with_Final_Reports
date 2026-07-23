@@ -129,3 +129,11 @@ The app safely escapes summary text, so dollar signs, backticks, indentation, an
 ## Summary template tolerance
 
 The summary viewer recognizes minor DOCX variations, including numbered headings with or without periods, `Field` or `Item` table headers, `Quote` or `Quotes`, `Source` or `Source file`, Word bullets, and databases created by older importer versions that appended tables after the paragraph text.
+
+## Robust summary detection update
+
+The importer and viewer now identify grant summaries from DOCX content as well as filenames. A file can therefore be named `summary.docx`, `AVF 18.005 Summary(10).docx`, or a UUID-style name and still be detected when it contains the expected grant-summary sections and tables.
+
+The selected project header includes a **Total funding** metric. Funding formats such as `$5 000`, `$10,000`, `$10 k`, and `US $59 814` are normalized for display and portfolio totals.
+
+The CES assessment always displays three columns: **Criterion**, **Result**, and **Reasoning**. A separate brief-explanation row is attached to the overall-classification row when that row otherwise has no reasoning.

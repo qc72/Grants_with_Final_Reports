@@ -3,219 +3,97 @@ from __future__ import annotations
 import html
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
+
+from docx import Document
+from docx.oxml.table import CT_Tbl
+from docx.oxml.text.paragraph import CT_P
+from docx.table import Table
+from docx.text.paragraph import Paragraph
 
 try:
     import streamlit as st
-except ModuleNotFoundError:  # Allows parser tests without the UI dependency.
+except ModuleNotFoundError:  # Parser tests can run without Streamlit.
     st = None
 
-# The generated summaries are mostly consistent, but some use "1 Narrative"
-# instead of "1. Narrative", "Item" instead of "Field", and "Quotes" or
-# "Source file" instead of the singular labels. The renderer intentionally
-# recognizes concepts rather than depending on one exact template.
 SECTION_RE = re.compile(r"^\s*(?:section\s+)?([1-5])\s*[.):-]?\s*(.+?)\s*$", re.IGNORECASE)
-LEADING_LIST_MARKER_RE = re.compile(r"^\s*(?:[•●▪◦‣–—-]|\[\[BULLET\]\])\s*")
-NOISE_LINES = {"top of form", "bottom of form"}
+LIST_RE = re.compile(r"^\s*(?:[•●▪◦‣–—-]|\[\[BULLET\]\])\s*")
+EVIDENCE_PREFIX_RE = re.compile(
+    r"^(?:evidence\s+)?(quotes?|source(?:\s+(?:file|document))?|why\s+(?:it|this)\s+matters|relevance)\s*:\s*(.*)$",
+    re.IGNORECASE,
+)
+NOISE = {"top of form", "bottom of form"}
+STATUS_PATTERN = re.compile(
+    r"^\s*(not\s+cel|partially|partial|uncertain|unclear|yes|no|cel|met|not\s+met)\b[\s:;,.\-–—]*(.*)$",
+    re.IGNORECASE,
+)
 
 
 @dataclass
-class SummarySection:
-    number: str
-    title: str
-    kind: str
-    lines: list[str] = field(default_factory=list)
-
-
-@dataclass
-class ParsedSummary:
+class SummaryData:
     title: str = ""
-    sections: list[SummarySection] = field(default_factory=list)
+    narrative: list[str] = field(default_factory=list)
+    facts: list[tuple[str, str]] = field(default_factory=list)
+    assessment: list[tuple[str, str, str]] = field(default_factory=list)
+    assessment_notes: list[tuple[str, str]] = field(default_factory=list)
+    evidence: list[dict[str, str]] = field(default_factory=list)
+    missing: list[str] = field(default_factory=list)
+    general: list[str] = field(default_factory=list)
 
 
-def _clean_line(value: str) -> str:
-    # Keep paragraph boundaries but normalize spacing introduced by Word cells.
-    return re.sub(r"[ \t\u00a0]+", " ", value.strip())
+def _clean(value: str) -> str:
+    return re.sub(r"\s+", " ", (value or "").replace("\u00a0", " ")).strip()
 
 
-def _strip_list_marker(value: str) -> str:
-    return LEADING_LIST_MARKER_RE.sub("", value).strip()
+def _strip_list(value: str) -> str:
+    return LIST_RE.sub("", _clean(value)).strip()
 
 
-def _normalized(value: str) -> str:
-    value = _strip_list_marker(_clean_line(value)).casefold()
+def _norm(value: str) -> str:
+    value = _strip_list(value).casefold()
     value = re.sub(r"\([^)]*\)", " ", value)
     value = re.sub(r"[^a-z0-9]+", " ", value)
     return re.sub(r"\s+", " ", value).strip()
 
 
-def _section_kind(title: str) -> str | None:
-    normalized = _normalized(title)
-    if "narrative" in normalized and "summary" in normalized:
+def _paragraph_is_list(paragraph: Paragraph) -> bool:
+    properties = paragraph._p.pPr
+    return bool(properties is not None and properties.numPr is not None)
+
+
+def _section_kind(value: str) -> str | None:
+    normalized = _norm(value)
+    if normalized.startswith("narrative") and "summary" in normalized:
         return "narrative"
-    if "key" in normalized and ("fact" in normalized or "information" in normalized):
+    if normalized in {"key facts", "key project facts", "project key facts"} or (
+        normalized.startswith("key ") and ("fact" in normalized or "information" in normalized)
+    ):
         return "facts"
-    if "evidence" in normalized and ("assessment" in normalized or "classification" in normalized):
+    if normalized in {"cel assessment", "ces assessment", "cel evidence assessment", "ces evidence assessment"}:
         return "assessment"
-    if "evidence" in normalized and ("quote" in normalized or normalized == "evidence"):
+    if normalized.startswith(("cel ", "ces ")) and (
+        "assessment" in normalized or "classification" in normalized
+    ):
+        return "assessment"
+    if normalized.startswith("evidence ") and ("assessment" in normalized or "classification" in normalized):
+        return "assessment"
+    if normalized in {"evidence", "evidence quote", "evidence quotes", "supporting evidence"}:
         return "evidence"
-    if "missing" in normalized or "uncertain information" in normalized or "information gaps" in normalized:
+    if normalized.startswith("missing") or normalized in {"uncertain information", "information gaps", "information gap"}:
         return "missing"
     return None
 
 
-def _canonical_title(kind: str, original: str) -> str:
-    return {
-        "narrative": "Narrative summary",
-        "facts": "Key facts",
-        "assessment": "CEL evidence assessment",
-        "evidence": "Evidence quotes",
-        "missing": "Missing or uncertain information",
-    }.get(kind, original.strip())
-
-
-def _unnumbered_heading_kind(line: str) -> str | None:
-    """Recognize only standalone heading phrases, not prose containing keywords."""
-    if ":" in line or len(line) > 80:
+def _heading_kind(line: str) -> str | None:
+    match = SECTION_RE.match(line)
+    if match:
+        return _section_kind(match.group(2))
+    if len(line) > 100 or ":" in line:
         return None
-    normalized = _normalized(line)
-    patterns = {
-        "narrative": (r"^narrative summary(?: words)?$",),
-        "facts": (r"^(?:key project facts|project key facts|key facts)$",),
-        "assessment": (r"^(?:cel )?evidence assessment$", r"^cel assessment$"),
-        "evidence": (r"^evidence quotes?$", r"^supporting evidence$"),
-        "missing": (
-            r"^missing(?: or)? uncertain information$",
-            r"^missing information$",
-            r"^information gaps$",
-        ),
-    }
-    for kind, expressions in patterns.items():
-        if any(re.fullmatch(expression, normalized) for expression in expressions):
-            return kind
-    return None
+    return _section_kind(line)
 
 
-def _extract_table_blocks(lines: list[str]) -> tuple[list[str], list[str], list[str]]:
-    """Remove Word-table rows from the flat text and classify them.
-
-    Very early importer versions appended all DOCX tables after all paragraphs.
-    Newer versions preserve their position. Recognizing the table headers globally
-    lets one renderer display both already-imported and newly imported records.
-    """
-    remaining: list[str] = []
-    fact_lines: list[str] = []
-    assessment_lines: list[str] = []
-    mode: str | None = None
-
-    for line in lines:
-        parts = _split_pipe_row(line)
-        if _is_two_column_header(parts):
-            mode = "facts"
-            continue
-        if _is_assessment_header(parts):
-            mode = "assessment"
-            continue
-
-        if mode and parts:
-            if mode == "facts":
-                fact_lines.append(line)
-            else:
-                assessment_lines.append(line)
-            continue
-
-        mode = None
-        remaining.append(line)
-
-    return remaining, fact_lines, assessment_lines
-
-
-def parse_summary(text: str) -> ParsedSummary:
-    lines = [_clean_line(line) for line in (text or "").splitlines()]
-    lines = [line for line in lines if line and _normalized(line) not in NOISE_LINES]
-    lines, fact_lines, assessment_lines = _extract_table_blocks(lines)
-
-    parsed = ParsedSummary()
-    current: SummarySection | None = None
-
-    for line in lines:
-        if not parsed.title and _normalized(line).startswith("grant summary"):
-            parsed.title = line
-            continue
-
-        match = SECTION_RE.match(line)
-        if match:
-            kind = _section_kind(match.group(2))
-            if kind:
-                current = SummarySection(
-                    number=match.group(1),
-                    title=_canonical_title(kind, match.group(2)),
-                    kind=kind,
-                )
-                parsed.sections.append(current)
-                continue
-
-        # Also tolerate unnumbered headings, provided the whole short line is a
-        # recognizable section title rather than ordinary narrative text.
-        unnumbered_kind = _unnumbered_heading_kind(line)
-        if unnumbered_kind:
-            number = {"narrative": "1", "facts": "2", "assessment": "3", "evidence": "4", "missing": "5"}[unnumbered_kind]
-            current = SummarySection(
-                number=number,
-                title=_canonical_title(unnumbered_kind, line),
-                kind=unnumbered_kind,
-            )
-            parsed.sections.append(current)
-            continue
-
-        if current is None:
-            current = SummarySection(number="", title="Summary", kind="general")
-            parsed.sections.append(current)
-        current.lines.append(line)
-
-    def ensure_section(kind: str, number: str, title: str) -> SummarySection:
-        existing = next((section for section in parsed.sections if section.kind == kind), None)
-        if existing is not None:
-            return existing
-        section = SummarySection(number=number, title=title, kind=kind)
-        insert_at = min(int(number) - 1, len(parsed.sections))
-        parsed.sections.insert(insert_at, section)
-        return section
-
-    if fact_lines:
-        ensure_section("facts", "2", "Key facts").lines.extend(fact_lines)
-    if assessment_lines:
-        ensure_section("assessment", "3", "CEL evidence assessment").lines.extend(assessment_lines)
-
-    return parsed
-
-
-def _split_pipe_row(line: str) -> list[str]:
-    if "|" not in line:
-        return []
-    return [_clean_line(part) for part in line.split("|")]
-
-
-def _is_two_column_header(parts: list[str]) -> bool:
-    if len(parts) < 2:
-        return False
-    left, right = _normalized(parts[0]), _normalized(parts[1])
-    return left in {"field", "item", "fact", "category", "attribute", "field item"} and right in {"detail", "details", "value", "description"}
-
-
-def _is_assessment_header(parts: list[str]) -> bool:
-    if len(parts) < 3:
-        return False
-    first = _normalized(parts[0])
-    second = _normalized(parts[1])
-    third = _normalized(parts[2])
-    return (
-        first in {"criterion", "criteria", "assessment criterion"}
-        and second in {"met", "met yes no", "status", "result"}
-        and any(token in third for token in ("explanation", "evidence", "detail", "reason"))
-    )
-
-
-def _normalize_academic_year(value: str) -> str:
+def _normalize_year(value: str) -> str:
     match = re.search(r"(?<!\d)(\d{4})\s*[-–—]\s*(\d{2}|\d{4})(?!\d)", value)
     if not match:
         return value
@@ -230,259 +108,443 @@ def _normalize_academic_year(value: str) -> str:
     return f"{start:04d}-{end:04d}"
 
 
-def _parse_facts(lines: list[str]) -> tuple[list[tuple[str, str]], list[str]]:
-    rows: list[tuple[str, str]] = []
-    leftovers: list[str] = []
-
-    for line in lines:
-        parts = _split_pipe_row(line)
-        if _is_two_column_header(parts):
-            continue
-        if len(parts) >= 2:
-            field_name = _strip_list_marker(parts[0])
-            detail = " | ".join(part for part in parts[1:] if part).strip()
-            if field_name and detail:
-                if _normalized(field_name) == "academic year":
-                    detail = _normalize_academic_year(detail)
-                rows.append((field_name, detail))
-                continue
-        leftovers.append(_strip_list_marker(line))
-
-    return rows, [line for line in leftovers if line]
+def _is_fact_header(row: list[str]) -> bool:
+    if len(row) < 2:
+        return False
+    first, second = _norm(row[0]), _norm(row[1])
+    return first in {"field", "item", "fact", "attribute", "field item"} and second in {
+        "detail", "details", "value", "description"
+    }
 
 
-def _parse_assessment(
-    lines: list[str],
-) -> tuple[list[tuple[str, str, str]], list[tuple[str, str]], list[str]]:
-    rows: list[tuple[str, str, str]] = []
-    notes: list[tuple[str, str]] = []
-    leftovers: list[str] = []
-
-    for line in lines:
-        parts = _split_pipe_row(line)
-        if _is_assessment_header(parts):
-            continue
-        if len(parts) >= 2:
-            label = _strip_list_marker(parts[0])
-            status = parts[1].strip() if len(parts) > 1 else ""
-            explanation = " | ".join(part for part in parts[2:] if part).strip()
-            normalized_label = _normalized(label)
-
-            if normalized_label == "confidence":
-                continue
-            if normalized_label in {"brief explanation", "assessment note", "summary explanation"}:
-                value = explanation or status
-                if value:
-                    notes.append((label, value))
-                continue
-            if label and (status or explanation):
-                rows.append((label, status, explanation))
-                continue
-        leftovers.append(_strip_list_marker(line))
-
-    return rows, notes, [line for line in leftovers if line]
+def _is_assessment_header(row: list[str]) -> bool:
+    if len(row) < 2:
+        return False
+    first, second = _norm(row[0]), _norm(row[1])
+    third = _norm(row[2]) if len(row) > 2 else ""
+    return (
+        first in {"criterion", "criteria", "assessment criterion"}
+        and second in {"met", "met yes no", "status", "result", "assessment"}
+        and (not third or any(token in third for token in ("explanation", "reason", "reasoning", "evidence", "detail")))
+    )
 
 
-PREFIX_RE = re.compile(
-    r"^(?:evidence\s+)?(quotes?|source(?:\s+(?:file|document))?|why\s+(?:it|this)\s+matters|relevance)\s*:\s*(.*)$",
-    re.IGNORECASE,
-)
+def _append_fact(data: SummaryData, field_name: str, detail: str) -> None:
+    field_name, detail = _clean(field_name), _clean(detail)
+    if not field_name or not detail:
+        return
+    if _norm(field_name) == "academic year":
+        detail = _normalize_year(detail)
+    row = (field_name, detail)
+    if not data.facts or data.facts[-1] != row:
+        data.facts.append(row)
 
 
-def _parse_evidence(lines: list[str]) -> list[dict[str, str]]:
+def _split_status_reasoning(value: str) -> tuple[str, str]:
+    value = _clean(value)
+    match = STATUS_PATTERN.match(value)
+    if match:
+        return _clean(match.group(1)), _clean(match.group(2))
+    return "", value
+
+
+def _append_assessment(data: SummaryData, criterion: str, status: str, reasoning: str) -> None:
+    criterion, status, reasoning = _clean(criterion), _clean(status), _clean(reasoning)
+    normalized = _norm(criterion)
+
+    if not criterion:
+        if data.assessment:
+            old_criterion, old_status, old_reasoning = data.assessment[-1]
+            if not reasoning and status:
+                status2, reasoning2 = _split_status_reasoning(status)
+                if status2:
+                    status, reasoning = status2, reasoning2
+                else:
+                    reasoning, status = status, ""
+            data.assessment[-1] = (
+                old_criterion,
+                _clean(f"{old_status} {status}"),
+                _clean(f"{old_reasoning} {reasoning}"),
+            )
+        return
+
+    if normalized == "confidence":
+        return
+    if normalized in {"brief explanation", "assessment note", "summary explanation", "reasoning"}:
+        value = reasoning or status
+        if value and data.assessment and not data.assessment[-1][2]:
+            previous_criterion, previous_status, _ = data.assessment[-1]
+            data.assessment[-1] = (previous_criterion, previous_status, value)
+        elif value:
+            data.assessment_notes.append((criterion, value))
+        return
+
+    # Some Word exports collapse the result and explanation into one cell.
+    if not reasoning and status:
+        split_status, split_reasoning = _split_status_reasoning(status)
+        if split_status:
+            status, reasoning = split_status, split_reasoning
+
+    row = (criterion, status, reasoning)
+    if not data.assessment or data.assessment[-1] != row:
+        data.assessment.append(row)
+
+
+def _parse_table(data: SummaryData, rows: list[list[str]], current_kind: str | None) -> None:
+    rows = [[_clean(cell) for cell in row] for row in rows if any(_clean(cell) for cell in row)]
+    if not rows:
+        return
+
+    kind = current_kind
+    if _is_fact_header(rows[0]):
+        kind = "facts"
+        rows = rows[1:]
+    elif _is_assessment_header(rows[0]):
+        kind = "assessment"
+        rows = rows[1:]
+    elif len(rows[0]) >= 3 and _norm(rows[0][0]) in {"criterion", "criteria"}:
+        kind = "assessment"
+        rows = rows[1:]
+    elif len(rows[0]) >= 2 and _norm(rows[0][0]) in {"field", "item", "attribute"}:
+        kind = "facts"
+        rows = rows[1:]
+
+    if kind == "facts":
+        for row in rows:
+            if len(row) >= 2:
+                _append_fact(data, row[0], " ".join(value for value in row[1:] if value))
+        return
+
+    if kind == "assessment":
+        for row in rows:
+            criterion = row[0] if row else ""
+            status = row[1] if len(row) > 1 else ""
+            reasoning = " ".join(value for value in row[2:] if value)
+            _append_assessment(data, criterion, status, reasoning)
+        return
+
+    # Header-independent recovery for slightly altered templates.
+    for row in rows:
+        if len(row) >= 3:
+            _append_assessment(data, row[0], row[1], " ".join(row[2:]))
+        elif len(row) >= 2:
+            _append_fact(data, row[0], row[1])
+
+
+def _parse_evidence_lines(lines: list[str]) -> list[dict[str, str]]:
     entries: list[dict[str, str]] = []
     current: dict[str, str] | None = None
-    active_field: str | None = None
+    active: str | None = None
 
-    def finish_current() -> None:
-        nonlocal current, active_field
+    def finish() -> None:
+        nonlocal current, active
         if current and any(current.get(key) for key in ("quote", "source", "why")):
             entries.append(current)
         current = None
-        active_field = None
+        active = None
 
-    for raw_line in lines:
-        line = _strip_list_marker(raw_line)
+    for raw in lines:
+        line = _strip_list(raw)
         if not line:
             continue
-
-        match = PREFIX_RE.match(line)
+        match = EVIDENCE_PREFIX_RE.match(line)
         if match:
             if current is None:
                 current = {"label": "Evidence"}
-            prefix = _normalized(match.group(1))
-            value = match.group(2).strip()
-            if prefix.startswith("quote"):
-                active_field = "quote"
-            elif prefix.startswith("source"):
-                active_field = "source"
-            else:
-                active_field = "why"
+            prefix, value = _norm(match.group(1)), _clean(match.group(2))
+            active = "quote" if prefix.startswith("quote") else "source" if prefix.startswith("source") else "why"
             if value:
-                current[active_field] = value
+                current[active] = value
             continue
-
-        # A non-prefixed line after a complete evidence item is the next label.
         if current and any(current.get(key) for key in ("quote", "source", "why")):
-            finish_current()
+            finish()
             current = {"label": line}
-            continue
-
-        # A wrapped line can continue the field that immediately preceded it.
-        if current is not None and active_field:
-            current[active_field] = f"{current.get(active_field, '')} {line}".strip()
         elif current is None:
             current = {"label": line}
+        elif active:
+            current[active] = _clean(f"{current.get(active, '')} {line}")
         else:
-            current["label"] = f"{current.get('label', '')} {line}".strip()
-
-    finish_current()
+            current["label"] = _clean(f"{current.get('label', '')} {line}")
+    finish()
     return entries
 
 
-def _render_styles() -> None:
+def summary_document_score(path: Path) -> int:
+    """Score any DOCX by its content, not only its filename.
+
+    This lets the app recognize summaries renamed to UUIDs or other generic names.
+    """
+    if path.suffix.lower() != ".docx" or not path.exists():
+        return -1
+    score = 8 if "summary" in path.name.casefold() else 0
+    try:
+        document = Document(path)
+        paragraph_text = [_clean(p.text) for p in document.paragraphs if _clean(p.text)]
+        first = paragraph_text[0] if paragraph_text else ""
+        joined = "\n".join(paragraph_text[:20])
+        if _norm(first).startswith("grant summary"):
+            score += 30
+        kinds = {_heading_kind(line) for line in paragraph_text[:30]}
+        score += 7 * len({"narrative", "facts", "assessment", "evidence", "missing"} & kinds)
+        for table in document.tables:
+            rows = [[_clean(cell.text) for cell in row.cells] for row in table.rows[:2]]
+            if rows and _is_fact_header(rows[0]):
+                score += 12
+            if rows and _is_assessment_header(rows[0]):
+                score += 12
+        if "grant id" in _norm(joined):
+            score += 3
+    except Exception:
+        return score - 20
+    return score
+
+
+def parse_docx_summary(path: Path) -> SummaryData:
+    document = Document(path)
+    data = SummaryData()
+    current_kind: str | None = None
+    evidence_lines: list[str] = []
+
+    for child in document.element.body.iterchildren():
+        if isinstance(child, CT_P):
+            paragraph = Paragraph(child, document)
+            raw_text = paragraph.text or ""
+            text = _clean(raw_text)
+            if not text or _norm(text) in NOISE:
+                continue
+            if not data.title and _norm(text).startswith("grant summary"):
+                data.title = text
+                continue
+            kind = _heading_kind(text)
+            if kind:
+                current_kind = kind
+                continue
+            if _paragraph_is_list(paragraph):
+                text = f"• {text}"
+            if current_kind == "narrative":
+                data.narrative.append(text)
+            elif current_kind == "evidence":
+                evidence_lines.extend(
+                    cleaned for part in raw_text.splitlines()
+                    if (cleaned := _clean(part))
+                )
+            elif current_kind == "missing":
+                data.missing.append(_strip_list(text))
+            elif current_kind == "facts":
+                if ":" in text:
+                    key, value = text.split(":", 1)
+                    _append_fact(data, key, value)
+                else:
+                    data.general.append(text)
+            elif current_kind == "assessment":
+                parts = [_clean(part) for part in re.split(r"\s*[|\t]\s*", text) if _clean(part)]
+                if len(parts) >= 2:
+                    _append_assessment(data, parts[0], parts[1], " ".join(parts[2:]))
+                else:
+                    data.general.append(text)
+            else:
+                data.general.append(text)
+        elif isinstance(child, CT_Tbl):
+            table = Table(child, document)
+            rows = [[cell.text for cell in row.cells] for row in table.rows]
+            _parse_table(data, rows, current_kind)
+
+    data.evidence = _parse_evidence_lines(evidence_lines)
+    return data
+
+
+def parse_text_summary(text: str) -> SummaryData:
+    data = SummaryData()
+    current_kind: str | None = None
+    evidence_lines: list[str] = []
+    table_mode: str | None = None
+
+    for raw_line in (text or "").splitlines():
+        line = _clean(raw_line)
+        if not line or _norm(line) in NOISE:
+            continue
+        if not data.title and _norm(line).startswith("grant summary"):
+            data.title = line
+            continue
+        kind = _heading_kind(line)
+        if kind:
+            current_kind = kind
+            table_mode = None
+            continue
+
+        if "|" in line:
+            parts = [_clean(part) for part in line.split("|")]
+            if _is_fact_header(parts):
+                table_mode = "facts"
+                continue
+            if _is_assessment_header(parts):
+                table_mode = "assessment"
+                continue
+            effective = table_mode or current_kind
+            if effective == "facts" and len(parts) >= 2:
+                _append_fact(data, parts[0], " ".join(value for value in parts[1:] if value))
+                continue
+            if effective == "assessment" and len(parts) >= 2:
+                _append_assessment(data, parts[0], parts[1], " ".join(value for value in parts[2:] if value))
+                continue
+
+        if current_kind == "narrative":
+            data.narrative.append(line)
+        elif current_kind == "evidence":
+            evidence_lines.append(line)
+        elif current_kind == "missing":
+            data.missing.append(_strip_list(line))
+        elif current_kind == "facts" and ":" in line:
+            key, value = line.split(":", 1)
+            _append_fact(data, key, value)
+        elif current_kind == "assessment":
+            data.general.append(line)
+        else:
+            data.general.append(line)
+
+    data.evidence = _parse_evidence_lines(evidence_lines)
+    return data
+
+
+def _merge(primary: SummaryData, fallback: SummaryData) -> SummaryData:
+    if not primary.title:
+        primary.title = fallback.title
+    if not primary.narrative:
+        primary.narrative = fallback.narrative
+    if not primary.facts:
+        primary.facts = fallback.facts
+    if not primary.assessment:
+        primary.assessment = fallback.assessment
+    if not primary.assessment_notes:
+        primary.assessment_notes = fallback.assessment_notes
+    if not primary.evidence:
+        primary.evidence = fallback.evidence
+    if not primary.missing:
+        primary.missing = fallback.missing
+    if not primary.general:
+        primary.general = fallback.general
+    return primary
+
+
+def load_summary(text: str, docx_path: Path | None = None) -> SummaryData:
+    fallback = parse_text_summary(text)
+    if docx_path and docx_path.exists():
+        try:
+            return _merge(parse_docx_summary(docx_path), fallback)
+        except Exception:
+            return fallback
+    return fallback
+
+
+def _styles() -> None:
     st.markdown(
         """
         <style>
-        .grant-summary p { line-height: 1.66; margin: 0 0 0.95rem 0; }
-        .grant-summary-table { width: 100%; border-collapse: collapse; table-layout: fixed; margin: 0.25rem 0 0.8rem 0; }
-        .grant-summary-table th { text-align: left; padding: 0.65rem 0.75rem; border-bottom: 2px solid rgba(128,128,128,.35); }
-        .grant-summary-table td { vertical-align: top; padding: 0.65rem 0.75rem; border-bottom: 1px solid rgba(128,128,128,.22); line-height: 1.45; overflow-wrap: anywhere; }
-        .grant-summary-table.facts th:first-child, .grant-summary-table.facts td:first-child { width: 28%; font-weight: 600; }
-        .grant-summary-table.assessment th:nth-child(1), .grant-summary-table.assessment td:nth-child(1) { width: 25%; }
-        .grant-summary-table.assessment th:nth-child(2), .grant-summary-table.assessment td:nth-child(2) { width: 12%; }
-        .grant-summary-table.assessment th:nth-child(3), .grant-summary-table.assessment td:nth-child(3) { width: 63%; }
-        .grant-evidence-card { border: 1px solid rgba(128,128,128,.25); border-radius: .55rem; padding: .85rem 1rem; margin: 0 0 .8rem 0; }
-        .grant-evidence-label { font-weight: 650; margin-bottom: .45rem; }
-        .grant-evidence-quote { border-left: 3px solid rgba(128,128,128,.45); padding-left: .8rem; line-height: 1.55; margin-bottom: .55rem; }
-        .grant-evidence-meta { font-size: .9rem; opacity: .78; margin-top: .35rem; }
-        .grant-summary-list { line-height: 1.6; margin-top: .2rem; }
+        .grant-summary-copy p { line-height: 1.68; margin: 0 0 1rem 0; }
+        .grant-table-wrap { width: 100%; overflow-x: auto; margin: .25rem 0 1rem 0; }
+        .grant-table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+        .grant-table th { text-align: left; padding: .65rem .75rem; border-bottom: 2px solid rgba(128,128,128,.35); }
+        .grant-table td { vertical-align: top; padding: .65rem .75rem; border-bottom: 1px solid rgba(128,128,128,.22); line-height: 1.5; overflow-wrap: anywhere; }
+        .grant-table.facts th:first-child, .grant-table.facts td:first-child { width: 28%; font-weight: 650; }
+        .grant-table.ces th:nth-child(1), .grant-table.ces td:nth-child(1) { width: 23%; font-weight: 600; }
+        .grant-table.ces th:nth-child(2), .grant-table.ces td:nth-child(2) { width: 12%; }
+        .grant-table.ces th:nth-child(3), .grant-table.ces td:nth-child(3) { width: 65%; }
+        .grant-evidence { border: 1px solid rgba(128,128,128,.25); border-radius: .6rem; padding: .9rem 1rem; margin: 0 0 .85rem 0; }
+        .grant-evidence-title { font-weight: 700; margin-bottom: .45rem; }
+        .grant-evidence-quote { border-left: 3px solid rgba(128,128,128,.45); padding-left: .8rem; line-height: 1.58; margin-bottom: .55rem; }
+        .grant-evidence-source { opacity: .75; font-size: .9rem; margin-top: .4rem; }
+        .grant-list { line-height: 1.65; }
+        @media (max-width: 760px) {
+          .grant-table.ces, .grant-table.ces thead, .grant-table.ces tbody, .grant-table.ces th, .grant-table.ces td, .grant-table.ces tr { display: block; width: 100% !important; }
+          .grant-table.ces thead { display: none; }
+          .grant-table.ces tr { border: 1px solid rgba(128,128,128,.25); border-radius: .55rem; margin-bottom: .75rem; padding: .3rem .5rem; }
+          .grant-table.ces td { border: 0; padding: .35rem .45rem; }
+          .grant-table.ces td::before { display: block; font-weight: 700; opacity: .72; font-size: .78rem; text-transform: uppercase; margin-bottom: .15rem; }
+          .grant-table.ces td:nth-child(1)::before { content: "Criterion"; }
+          .grant-table.ces td:nth-child(2)::before { content: "Result"; }
+          .grant-table.ces td:nth-child(3)::before { content: "Reasoning"; }
+        }
         </style>
         """,
         unsafe_allow_html=True,
     )
 
 
-def _safe_paragraph(text: str) -> None:
+def _paragraph(value: str) -> None:
     st.markdown(
-        f'<div class="grant-summary"><p>{html.escape(_strip_list_marker(text))}</p></div>',
+        f'<div class="grant-summary-copy"><p>{html.escape(_strip_list(value))}</p></div>',
         unsafe_allow_html=True,
     )
 
 
-def _render_bullet_items(items: list[str]) -> None:
-    if not items:
-        return
-    body = "".join(f"<li>{html.escape(_strip_list_marker(item))}</li>" for item in items if item)
-    st.markdown(f'<ul class="grant-summary-list">{body}</ul>', unsafe_allow_html=True)
-
-
-def _render_narrative(lines: list[str]) -> None:
-    index = 0
-    while index < len(lines):
-        line = lines[index]
-        if LEADING_LIST_MARKER_RE.match(line):
-            bullets: list[str] = []
-            while index < len(lines) and LEADING_LIST_MARKER_RE.match(lines[index]):
-                bullets.append(lines[index])
-                index += 1
-            _render_bullet_items(bullets)
-            continue
-
-        _safe_paragraph(line)
-
-        # Older stored summaries lost Word's bullet marker. Recover common lists
-        # where a colon-introduction is followed by lowercase list items.
-        if line.rstrip().endswith(":"):
-            inferred: list[str] = []
-            probe = index + 1
-            while probe < len(lines) and len(inferred) < 8:
-                candidate = _strip_list_marker(lines[probe])
-                if candidate and candidate[:1].islower() and len(candidate) <= 220:
-                    inferred.append(candidate)
-                    probe += 1
-                else:
-                    break
-            if inferred:
-                _render_bullet_items(inferred)
-                index = probe
-                continue
-        index += 1
-
-
-def _render_html_table(rows: list[tuple[str, ...]], headers: tuple[str, ...], css_class: str) -> None:
+def _table(rows: list[tuple[str, ...]], headers: tuple[str, ...], css_class: str) -> None:
     if not rows:
-        st.info("No structured information was included in this section.")
+        st.caption("No structured information was included in this section.")
         return
-    header_html = "".join(f"<th>{html.escape(value)}</th>" for value in headers)
-    row_html = "".join(
-        "<tr>" + "".join(f"<td>{html.escape(str(value))}</td>" for value in row) + "</tr>"
+    head = "".join(f"<th>{html.escape(header)}</th>" for header in headers)
+    body = "".join(
+        "<tr>" + "".join(f"<td>{html.escape(value or '—')}</td>" for value in row) + "</tr>"
         for row in rows
     )
     st.markdown(
-        f'<table class="grant-summary-table {css_class}"><thead><tr>{header_html}</tr></thead><tbody>{row_html}</tbody></table>',
+        f'<div class="grant-table-wrap"><table class="grant-table {css_class}"><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>',
         unsafe_allow_html=True,
     )
 
 
-def _render_evidence(lines: list[str]) -> None:
-    entries = _parse_evidence(lines)
-    if not entries:
-        for line in lines:
-            _safe_paragraph(line)
-        return
-
-    for entry in entries:
-        label = html.escape(entry.get("label", "Evidence"))
-        quote = entry.get("quote", "")
-        source = entry.get("source", "")
-        why = entry.get("why", "")
-        pieces = [f'<div class="grant-evidence-label">{label}</div>']
-        if quote:
-            pieces.append(f'<div class="grant-evidence-quote">{html.escape(quote)}</div>')
-        if why:
-            pieces.append(f'<div>{html.escape(why)}</div>')
-        if source:
-            pieces.append(f'<div class="grant-evidence-meta">Source: {html.escape(source)}</div>')
-        st.markdown(f'<div class="grant-evidence-card">{"".join(pieces)}</div>', unsafe_allow_html=True)
+def _bullets(values: list[str]) -> None:
+    items = "".join(f"<li>{html.escape(_strip_list(value))}</li>" for value in values if _strip_list(value))
+    if items:
+        st.markdown(f'<ul class="grant-list">{items}</ul>', unsafe_allow_html=True)
 
 
-def render_summary(text: str) -> None:
-    """Render a generated DOCX summary despite small template variations."""
+def render_summary(text: str, docx_path: Path | None = None) -> None:
     if st is None:
         raise RuntimeError("Streamlit is required to render summaries.")
+    data = load_summary(text, docx_path)
+    _styles()
 
-    parsed = parse_summary(text)
-    if not parsed.sections:
-        st.info("No summary content is available.")
-        return
+    if data.title:
+        st.caption(data.title)
 
-    _render_styles()
+    st.markdown("### 1. Narrative summary")
+    narrative = data.narrative or data.general
+    if narrative:
+        for paragraph in narrative:
+            _paragraph(paragraph)
+    else:
+        st.caption("No narrative summary was found.")
+    st.divider()
 
-    for index, section in enumerate(parsed.sections):
-        heading = f"{section.number}. {section.title}" if section.number else section.title
-        st.markdown(f"### {html.escape(heading)}")
+    st.markdown("### 2. Key facts")
+    _table(data.facts, ("Field", "Detail"), "facts")
+    st.divider()
 
-        if section.kind == "facts":
-            rows, leftovers = _parse_facts(section.lines)
-            _render_html_table(rows, ("Field", "Detail"), "facts")
-            for line in leftovers:
-                _safe_paragraph(line)
-        elif section.kind == "assessment":
-            rows, notes, leftovers = _parse_assessment(section.lines)
-            _render_html_table(rows, ("Criterion", "Met?", "Explanation"), "assessment")
-            for label, value in notes:
-                st.markdown(f"**{html.escape(label)}:** {html.escape(value)}")
-            for line in leftovers:
-                _safe_paragraph(line)
-        elif section.kind == "evidence":
-            _render_evidence(section.lines)
-        elif section.kind == "missing":
-            _render_bullet_items(section.lines)
-        elif section.kind == "narrative":
-            _render_narrative(section.lines)
-        else:
-            _render_narrative(section.lines)
+    st.markdown("### 3. CES evidence assessment")
+    # Every displayed assessment row always has a third reasoning column.
+    assessment_rows = [(criterion, result, reasoning or "—") for criterion, result, reasoning in data.assessment]
+    _table(assessment_rows, ("Criterion", "Result", "Reasoning"), "ces")
+    for label, value in data.assessment_notes:
+        st.info(f"{label}: {value}")
+    st.divider()
 
-        if index < len(parsed.sections) - 1:
-            st.divider()
+    st.markdown("### 4. Evidence quotes")
+    if data.evidence:
+        for item in data.evidence:
+            pieces = [f'<div class="grant-evidence-title">{html.escape(item.get("label", "Evidence"))}</div>']
+            if item.get("quote"):
+                pieces.append(f'<div class="grant-evidence-quote">{html.escape(item["quote"])}</div>')
+            if item.get("why"):
+                pieces.append(f'<div>{html.escape(item["why"])}</div>')
+            if item.get("source"):
+                pieces.append(f'<div class="grant-evidence-source">Source: {html.escape(item["source"])}</div>')
+            st.markdown(f'<div class="grant-evidence">{"".join(pieces)}</div>', unsafe_allow_html=True)
+    else:
+        st.caption("No evidence quotes were included.")
+    st.divider()
+
+    st.markdown("### 5. Missing or uncertain information")
+    if data.missing:
+        _bullets(data.missing)
+    else:
+        st.caption("No missing-information notes were included.")

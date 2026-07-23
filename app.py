@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 
 import fitz
@@ -21,7 +22,7 @@ from database import (
     set_report_override,
 )
 from importer import import_zip_bytes, import_zip_path
-from summary_renderer import render_summary
+from summary_renderer import render_summary, summary_document_score
 
 st.set_page_config(page_title="Grant Insights Explorer", page_icon="📚", layout="wide")
 ensure_directories()
@@ -29,10 +30,24 @@ initialize_database(DB_PATH)
 
 
 def money_number(value: str) -> float:
-    try:
-        return float(value.replace("$", "").replace(",", "").strip())
-    except (AttributeError, ValueError):
+    """Parse common grant formats such as $5 000, $10,000, $10 k, or $1.2M."""
+    if not value:
         return 0.0
+    text = str(value).strip().casefold().replace(",", "").replace(" ", "")
+    match = re.search(r"(-?\d+(?:\.\d+)?)([km]?)", text)
+    if not match:
+        return 0.0
+    amount = float(match.group(1))
+    if match.group(2) == "k":
+        amount *= 1_000
+    elif match.group(2) == "m":
+        amount *= 1_000_000
+    return amount
+
+
+def funding_display(value: str) -> str:
+    amount = money_number(value)
+    return f"${amount:,.0f}" if amount else (value or "—")
 
 
 def human_size(size: int) -> str:
@@ -72,6 +87,38 @@ def project_quality(row: dict) -> str:
 
 def resolve_document(project: dict, relative_path: str) -> Path:
     return DOCUMENT_ROOT / project["storage_folder"] / relative_path
+
+
+def find_summary_document(project: dict, files: list[dict]) -> Path | None:
+    """Find a summary DOCX by metadata, filename, or document content.
+
+    Older imports and externally renamed files may not have ``summary`` in the
+    filename. We therefore inspect every stored DOCX and choose the one whose
+    content most closely matches the grant-summary structure.
+    """
+    project_root = DOCUMENT_ROOT / project["storage_folder"]
+    candidates: dict[Path, int] = {}
+
+    for item in files:
+        if str(item.get("suffix", "")).lower() != ".docx":
+            continue
+        candidate = resolve_document(project, item["relative_path"])
+        if candidate.exists():
+            bonus = 100 if item.get("role") == "summary" else 30 if "summary" in str(item.get("filename", "")).casefold() else 0
+            candidates[candidate] = max(candidates.get(candidate, -999), bonus + summary_document_score(candidate))
+
+    # Recover when the database's source-file metadata came from an older app
+    # version or no longer matches the storage directory exactly.
+    if project_root.exists():
+        for candidate in project_root.rglob("*.docx"):
+            score = summary_document_score(candidate)
+            if score >= 20:
+                candidates[candidate] = max(candidates.get(candidate, -999), score)
+
+    if not candidates:
+        return None
+    selected, score = max(candidates.items(), key=lambda item: (item[1], -len(item[0].name), item[0].name.casefold()))
+    return selected if score >= 20 else None
 
 
 def display_pdf(path: Path) -> None:
@@ -209,6 +256,10 @@ if page == "Explore projects":
     st.caption(
         f"Source batch: {project['source_batch']} · Updated: {project['updated_at']}"
     )
+    selected_metric_1, selected_metric_2, selected_metric_3 = st.columns(3)
+    selected_metric_1.metric("Total funding", funding_display(project["funding_amount"]))
+    selected_metric_2.metric("Academic year", project["academic_year"] or "—")
+    selected_metric_3.metric("Category", project["category"] or "—")
 
     overview, insights, evidence, report_tab, files_tab = st.tabs(
         ["Overview", "Insights", "Source text", "Final report", "Files"]
@@ -219,7 +270,7 @@ if page == "Explore projects":
             show_field("Category", project["category"])
             show_field("Program", project["program"])
             show_field("Academic year", project["academic_year"])
-            show_field("Funding", project["funding_amount"])
+            show_field("Funding", funding_display(project["funding_amount"]))
             show_field("Principal investigator", project["principal_investigator"])
             show_field("PI college / department", project["pi_college"])
         with right:
@@ -233,9 +284,10 @@ if page == "Explore projects":
         show_field("Community impact", project["community_impact"])
         show_field("Publications / products", project["publications"])
         show_field("Brief assessment", project["brief_explanation"])
-        if project["summary_text"]:
+        summary_document = find_summary_document(project, files)
+        if project["summary_text"] or summary_document:
             with st.expander("Full summary", expanded=True):
-                render_summary(project["summary_text"])
+                render_summary(project["summary_text"], docx_path=summary_document)
 
     with evidence:
         for heading, value in (

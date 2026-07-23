@@ -14,6 +14,7 @@ from docx.table import Table
 from docx.text.paragraph import Paragraph
 
 PROJECT_ID_RE = re.compile(r"\b([A-Za-z]{2,})[ _-]+(\d{2}\.\d{3})\b")
+PARSER_VERSION = "summary-structure-v4"
 
 
 @dataclass
@@ -223,6 +224,10 @@ def file_sha256(path: Path) -> str:
 
 def fingerprint_project(folder: Path, files: list[Path]) -> str:
     digest = hashlib.sha256()
+    # Include the parser schema so a corrected parser can refresh existing
+    # projects even when their source files themselves have not changed.
+    digest.update(PARSER_VERSION.encode("utf-8"))
+    digest.update(b"\0")
     for path in sorted(files, key=lambda item: item.relative_to(folder).as_posix().lower()):
         relative = path.relative_to(folder).as_posix()
         digest.update(relative.encode("utf-8", errors="replace"))
@@ -348,6 +353,45 @@ def identify_project_directories(root: Path) -> list[tuple[str, Path, list[str]]
     return sorted(results, key=lambda item: item[0])
 
 
+def summary_docx_score(path: Path) -> int:
+    """Identify summary DOCX files by content as well as filename.
+
+    This supports files whose names were changed to UUIDs or other generic names.
+    """
+    if path.suffix.lower() != ".docx":
+        return -1
+    score = 8 if "summary" in path.name.casefold() else 0
+    try:
+        document = Document(path)
+        paragraphs = [re.sub(r"\s+", " ", p.text).strip() for p in document.paragraphs if p.text.strip()]
+        first = paragraphs[0].casefold() if paragraphs else ""
+        joined = "\n".join(paragraphs[:30]).casefold()
+        if first.startswith("grant summary"):
+            score += 30
+        for phrase in ("narrative summary", "key facts", "evidence assessment", "evidence quotes", "missing or uncertain"):
+            if phrase in joined:
+                score += 6
+        for table in document.tables:
+            if not table.rows:
+                continue
+            header = [normalize_label(cell.text) for cell in table.rows[0].cells]
+            if len(header) >= 2 and header[0] in {"field", "item", "attribute"} and header[1] in {"detail", "details", "value"}:
+                score += 12
+            if len(header) >= 2 and header[0] in {"criterion", "criteria"} and header[1] in {"met", "status", "result", "assessment"}:
+                score += 12
+    except Exception:
+        return score - 20
+    return score
+
+
+def find_summary_file(files: list[Path]) -> Path | None:
+    candidates = [(summary_docx_score(path), path) for path in files if path.suffix.lower() == ".docx"]
+    candidates = [(score, path) for score, path in candidates if score >= 20]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: (item[0], -len(item[1].name), item[1].name.casefold()))[1]
+
+
 def find_best_file(files: list[Path], *, suffix: str, include: tuple[str, ...]) -> Path | None:
     candidates = [
         path
@@ -359,11 +403,23 @@ def find_best_file(files: list[Path], *, suffix: str, include: tuple[str, ...]) 
     return sorted(candidates, key=lambda path: (len(path.name), path.name.lower()))[0]
 
 
-def role_for_file(path: Path, selected_report: str) -> str:
+def role_for_file(
+    path: Path,
+    selected_report: str,
+    selected_summary: str = "",
+    selected_highlight: str = "",
+    selected_note: str = "",
+) -> str:
     name = path.name.lower()
     relative = path.as_posix()
     if relative == selected_report:
         return "final_report"
+    if relative == selected_summary:
+        return "summary"
+    if relative == selected_highlight:
+        return "highlight"
+    if relative == selected_note:
+        return "project_note"
     if path.suffix.lower() == ".docx" and "summary" in name:
         return "summary"
     if path.suffix.lower() == ".txt" and "highlight" in name:
@@ -377,7 +433,7 @@ def role_for_file(path: Path, selected_report: str) -> str:
 
 def scan_project(folder: Path, expected_project_id: str | None = None) -> ProjectRecord:
     files = [path for path in folder.rglob("*") if path.is_file()]
-    summary_path = find_best_file(files, suffix=".docx", include=("summary",))
+    summary_path = find_summary_file(files)
     highlight_path = find_best_file(files, suffix=".txt", include=("highlight",))
     note_path = next(
         (
@@ -441,7 +497,13 @@ def scan_project(folder: Path, expected_project_id: str | None = None) -> Projec
                 "suffix": path.suffix.lower(),
                 "size_bytes": path.stat().st_size,
                 "sha256": file_sha256(path),
-                "role": role_for_file(Path(relative_path), automatic_report),
+                "role": role_for_file(
+                    Path(relative_path),
+                    automatic_report,
+                    summary_path.relative_to(folder).as_posix() if summary_path else "",
+                    highlight_path.relative_to(folder).as_posix() if highlight_path else "",
+                    note_path.relative_to(folder).as_posix() if note_path else "",
+                ),
             }
         )
 

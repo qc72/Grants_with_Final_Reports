@@ -1,102 +1,105 @@
 from __future__ import annotations
 
-from summary_renderer import (
-    _parse_assessment,
-    _parse_evidence,
-    _parse_facts,
-    parse_summary,
-)
+from pathlib import Path
+
+from docx import Document
+
+from summary_renderer import load_summary, parse_docx_summary, parse_text_summary
 
 
-def section(parsed, kind: str):
-    return next(item for item in parsed.sections if item.kind == kind)
+def build_variant_summary(path: Path) -> None:
+    doc = Document()
+    doc.add_paragraph("Grant Summary: AVF 18.005 — Example")
+    doc.add_paragraph("1 Narrative summary")
+    doc.add_paragraph("Readable narrative.")
+    doc.add_paragraph("2 Key facts")
+    facts = doc.add_table(rows=1, cols=2)
+    facts.rows[0].cells[0].text = "Item"
+    facts.rows[0].cells[1].text = "Detail"
+    for key, value in (
+        ("Grant ID", "AVF 18.005"),
+        ("Academic year", "2017-2018 (activities 2018-19)"),
+    ):
+        cells = facts.add_row().cells
+        cells[0].text, cells[1].text = key, value
+
+    doc.add_paragraph("3 CES evidence assessment")
+    assessment = doc.add_table(rows=1, cols=3)
+    assessment.rows[0].cells[0].text = "Criterion"
+    assessment.rows[0].cells[1].text = "Result"
+    assessment.rows[0].cells[2].text = "Reasoning"
+    cells = assessment.add_row().cells
+    cells[0].text = "Community need"
+    cells[1].text = "Yes"
+    cells[2].text = "Demonstrated by partner requests."
+    cells = assessment.add_row().cells
+    cells[0].text = "Confidence"
+    cells[1].text = "0.60"
+    cells[2].text = "Internal score."
+
+    doc.add_paragraph("4 Evidence quotes")
+    doc.add_paragraph(
+        "Student learning\n"
+        "Quotes: “Example quote.”\n"
+        "Source file: Final Report.pdf\n"
+        "Why it matters: Demonstrates learning."
+    )
+    doc.add_paragraph("5 Missing or uncertain information")
+    doc.add_paragraph("One missing item.")
+    doc.save(path)
 
 
-def test_accepts_item_header_and_headings_without_periods():
-    text = """Grant Summary: AVF 18.005 — Example
-1 Narrative summary
-Readable narrative.
-2 Key facts
-Item | Detail
-Grant ID | AVF 18.005
-Academic year | 2017-2018 (activities 2018-19)
-3 CEL evidence assessment
-Criterion | Met? | Explanation
-Community need | Yes | Demonstrated.
-Confidence | 0.60 | Internal score.
-4 Evidence quotes
-Student learning
-Quotes: “Example quote.”
-Source file: Final Report.pdf
-Why it matters: Demonstrates learning.
-5 Missing or uncertain information
-One missing item.
-"""
-    parsed = parse_summary(text)
-    assert [item.kind for item in parsed.sections] == [
-        "narrative", "facts", "assessment", "evidence", "missing"
+def test_reads_docx_tables_and_reasoning_column(tmp_path: Path):
+    path = tmp_path / "summary.docx"
+    build_variant_summary(path)
+    data = parse_docx_summary(path)
+
+    assert data.narrative == ["Readable narrative."]
+    assert ("Grant ID", "AVF 18.005") in data.facts
+    assert ("Academic year", "2017-2018") in data.facts
+    assert data.assessment == [
+        ("Community need", "Yes", "Demonstrated by partner requests.")
     ]
-    facts, leftovers = _parse_facts(section(parsed, "facts").lines)
-    assert leftovers == []
-    assert ("Grant ID", "AVF 18.005") in facts
-    assert ("Academic year", "2017-2018") in facts
-
-    assessment, notes, leftovers = _parse_assessment(section(parsed, "assessment").lines)
-    assert assessment == [("Community need", "Yes", "Demonstrated.")]
-    assert notes == []
-    assert leftovers == []
-
-    evidence = _parse_evidence(section(parsed, "evidence").lines)
-    assert evidence[0]["quote"] == "“Example quote.”"
-    assert evidence[0]["source"] == "Final Report.pdf"
+    assert data.evidence[0]["source"] == "Final Report.pdf"
+    assert data.missing == ["One missing item."]
 
 
-def test_recovers_tables_appended_by_legacy_importer():
-    text = """Grant Summary: ECG 17.030 — Example
+def test_text_fallback_always_preserves_third_assessment_field():
+    data = parse_text_summary(
+        """Grant Summary: AVF 18.005 — Example
 1. Narrative summary
 Narrative.
 2. Key facts
+Item | Detail
+Grant ID | AVF 18.005
 3. CEL evidence assessment
-4. Evidence quotes
-Evidence label
-Quote: “Quote.”
-Source: report.pdf
-Why it matters: Useful.
-5. Missing or uncertain information
-A genuine missing item.
-Field | Detail
-Grant ID | ECG 17.030
-Funding amount | $1,000
 Criterion | Met? | Explanation
 Community need | Yes | Demonstrated.
-Confidence | 0.80 | Internal score.
+Overall classification | CEL |
+Confidence | 0.60 | Internal score.
+4. Evidence quotes
+5. Missing or uncertain information
 """
-    parsed = parse_summary(text)
-    facts, _ = _parse_facts(section(parsed, "facts").lines)
-    assessment, _, _ = _parse_assessment(section(parsed, "assessment").lines)
-    assert len(facts) == 2
-    assert len(assessment) == 1
-    assert section(parsed, "missing").lines == ["A genuine missing item."]
-
-
-def test_accepts_unnumbered_section_headings():
-    parsed = parse_summary("""Grant Summary: ABC 20.001 — Example
-Narrative summary
-Narrative.
-Key project facts
-Attribute | Value
-Grant ID | ABC 20.001
-CEL evidence assessment
-Assessment criterion | Status | Evidence / explanation
-Learning integration | Yes | Demonstrated.
-Evidence quotes
-Output
-Evidence quote: “Created.”
-Source document: report.pdf
-Relevance: Shows an output.
-Information gaps
-None documented.
-""")
-    assert [item.kind for item in parsed.sections] == [
-        "narrative", "facts", "assessment", "evidence", "missing"
+    )
+    assert data.assessment == [
+        ("Community need", "Yes", "Demonstrated."),
+        ("Overall classification", "CEL", ""),
     ]
+    assert all(len(row) == 3 for row in data.assessment)
+
+
+def test_docx_is_preferred_over_stale_flattened_text(tmp_path: Path):
+    path = tmp_path / "summary.docx"
+    build_variant_summary(path)
+    data = load_summary("Old unreadable text only", docx_path=path)
+    assert data.facts
+    assert data.assessment[0][2] == "Demonstrated by partner requests."
+
+
+def test_summary_detection_works_with_uuid_filename(tmp_path: Path):
+    path = tmp_path / "e341010a-94fa-4bb7-9796-2b5ef5fea04c.docx"
+    build_variant_summary(path)
+    from summary_renderer import summary_document_score
+    assert summary_document_score(path) >= 20
+    data = parse_docx_summary(path)
+    assert data.assessment[0][2] == "Demonstrated by partner requests."
