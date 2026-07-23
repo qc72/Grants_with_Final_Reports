@@ -21,6 +21,7 @@ from database import (
     set_report_override,
 )
 from importer import import_zip_bytes, import_zip_path
+from summary_renderer import render_summary
 
 st.set_page_config(page_title="Grant Insights Explorer", page_icon="📚", layout="wide")
 ensure_directories()
@@ -234,7 +235,7 @@ if page == "Explore projects":
         show_field("Brief assessment", project["brief_explanation"])
         if project["summary_text"]:
             with st.expander("Full summary", expanded=True):
-                st.markdown(project["summary_text"])
+                render_summary(project["summary_text"])
 
     with evidence:
         for heading, value in (

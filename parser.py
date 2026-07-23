@@ -8,6 +8,10 @@ from typing import Iterable
 
 import fitz  # PyMuPDF
 from docx import Document
+from docx.oxml.table import CT_Tbl
+from docx.oxml.text.paragraph import CT_P
+from docx.table import Table
+from docx.text.paragraph import Paragraph
 
 PROJECT_ID_RE = re.compile(r"\b([A-Za-z]{2,})[ _-]+(\d{2}\.\d{3})\b")
 
@@ -111,14 +115,23 @@ def read_text(path: Path) -> str:
 
 
 def read_docx(path: Path) -> str:
+    """Read paragraphs and tables in their original DOCX order."""
     doc = Document(path)
     chunks: list[str] = []
-    chunks.extend(p.text.strip() for p in doc.paragraphs if p.text.strip())
-    for table in doc.tables:
-        for row in table.rows:
-            cells = [cell.text.strip() for cell in row.cells]
-            if any(cells):
-                chunks.append(" | ".join(cells))
+
+    for child in doc.element.body.iterchildren():
+        if isinstance(child, CT_P):
+            paragraph = Paragraph(child, doc)
+            text = paragraph.text.strip()
+            if text:
+                chunks.append(text)
+        elif isinstance(child, CT_Tbl):
+            table = Table(child, doc)
+            for row in table.rows:
+                cells = [re.sub(r"\s+", " ", cell.text).strip() for cell in row.cells]
+                if any(cells):
+                    chunks.append(" | ".join(cells))
+
     return "\n".join(chunks)
 
 

@@ -113,3 +113,15 @@ SQLite is appropriate for a single internal app and modest concurrent use. Move 
 
 - `Category` is derived from the first three characters of the canonical project ID.
 - Academic years are displayed as `YYYY-YYYY`; parenthetical activity notes are ignored.
+
+## Summary display
+
+Generated summary DOCX files are displayed as structured content rather than raw Markdown:
+
+- Narrative paragraphs
+- Key-facts table
+- CEL evidence-assessment table
+- Evidence quote cards
+- Missing-information bullets
+
+The app safely escapes summary text, so dollar signs, backticks, indentation, and other Markdown-like characters do not change the display. New imports also preserve the original order of DOCX paragraphs and tables. Existing database records are supported by the renderer without requiring a full database reset; re-importing a batch refreshes the stored summary text using the improved DOCX parser.
