@@ -1,0 +1,15 @@
+services:
+  grant-insights:
+    build: .
+    ports:
+      - "8501:8501"
+    environment:
+      GRANT_INSIGHTS_HOME: /data
+      GRANT_INSIGHTS_ADMIN_PASSWORD: change-this-password
+    volumes:
+      - grant-insights-data:/data
+      - ./incoming:/incoming:ro
+    restart: unless-stopped
+
+volumes:
+  grant-insights-data:

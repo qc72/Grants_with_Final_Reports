@@ -1,17 +1,25 @@
-# Grant Insights Explorer
+# Grant Insights Explorer — Batch Edition
 
-A starter Streamlit interface for a ZIP containing many project folders, typically named like `AVF 18.007 ...`.
+A working starter for a large collection of grant-project folders. Administrators upload several smaller ZIP batches; every batch is merged into one persistent database. Nontechnical users open a browser URL and search the combined collection.
 
-## What it does
+## Included workflow
 
-- Uploads one master ZIP.
-- Safely extracts it and blocks ZIP path traversal.
-- Finds project folders using IDs like `XXX 18.007`.
-- Reads `summary*.docx`, `*highlight*.txt`, and `*project*note*.txt` case-insensitively.
-- Scores every PDF to identify the most likely final report, even when the filename is inconsistent.
-- Provides filters, an interactive project table, project details, a PDF viewer, source-file downloads, quality flags, and CSV export.
+1. An administrator creates ZIP batches, ideally about 25–50 project folders each.
+2. Each project folder is detected by an ID such as `AVF 18.007`.
+3. The importer reads `summary*.docx`, `*highlight*.txt`, and `*project*note*.txt` case-insensitively.
+4. Every PDF is scored using filename and document-content signals to find the likely final report.
+5. A SHA-256 project fingerprint determines whether the project is new, changed, or unchanged.
+6. New projects are inserted, changed projects are updated, and unchanged projects are skipped.
+7. Users browse all batches together through the Streamlit interface.
 
-## Run locally for development
+## Main pages
+
+- **Explore projects:** searchable directory, standardized insights, source text, PDF viewer, and downloads.
+- **Review queue:** administrator correction of uncertain final-report choices.
+- **Admin imports:** multiple browser ZIP uploads or one server-path ZIP import.
+- **Import history:** run totals and project-level errors/warnings.
+
+## Run locally
 
 ```bash
 python -m venv .venv
@@ -21,34 +29,77 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-## Best deployment for non-Python users
+Open the local URL shown by Streamlit, normally `http://localhost:8501`.
 
-Run the app once on an internal server and give users a browser URL. They install nothing.
+The included demo batch can be imported from the Admin page or from the command line:
 
 ```bash
-docker build -t grant-insights .
-docker run --rm -p 8501:8501 grant-insights
+python cli_ingest.py demo/AVF_18_007_batch.zip --batch-name "Demo batch"
 ```
 
-Then open `http://SERVER-NAME:8501`.
+## Run with Docker
 
-## Recommended production additions
+Change the admin password in `docker-compose.yml`, then run:
 
-1. Add organizational sign-in through your reverse proxy or identity provider.
-2. Store the extracted documents in protected file/object storage rather than a temporary directory.
-3. Store normalized metadata and manual report overrides in SQLite/PostgreSQL.
-4. Run ingestion as an administrator-only action; make normal users read-only.
-5. Add a review queue for low-confidence report matches and missing files.
-6. Add full-text search over summaries, highlights, notes, and PDF text.
-7. Log the source file and extraction date for every displayed value.
+```bash
+docker compose up --build -d
+```
 
-## Final-report scoring
+Open `http://localhost:8501` or the corresponding server address.
 
-The starter combines filename signals and PDF text signals. It boosts phrases such as `final report`, submission metadata, and final-report questionnaire language. It penalizes files containing `budget`, `application`, `proposal`, `worksheet`, or `interim`. Every candidate and reason is visible in the Quality Review tab.
+The Docker volume preserves the SQLite database and imported documents across restarts. ZIP files placed in `./incoming` are mounted read-only at `/incoming` and can be imported through the server-path control.
 
-## Important security notes
+## Batch structure
 
-- Do not deploy sensitive grant documents to a public hosting service.
-- Keep the app behind your organization’s authentication/VPN.
-- Add malware scanning and upload-size limits before broad production use.
-- Treat uploaded filenames and document text as untrusted input.
+```text
+batch_01.zip
+├── AVF 18.001 - Project title/
+│   ├── AVF 18.001 Summary.docx
+│   ├── AVF_18.001_highlight.txt
+│   ├── AVF_18.001_PROJECT_NOTE.txt
+│   └── report-with-any-name.pdf
+├── AVF 18.002 - Another title/
+└── ...
+```
+
+The folders may be nested under year/program folders. The importer searches recursively.
+
+## Database behavior
+
+`project_id` is the unique project key. For each incoming project:
+
+- no existing ID → **new**
+- existing ID with a different fingerprint → **updated**
+- existing ID with the same fingerprint → **skipped**
+
+A saved manual final-report override is retained when a project is updated.
+
+## Data folders
+
+By default:
+
+```text
+data/
+├── grants.db
+└── documents/
+    └── AVF_18_007/
+```
+
+Set `GRANT_INSIGHTS_HOME` to move all persistent data. You can separately set `GRANT_INSIGHTS_DB` and `GRANT_INSIGHTS_DOCUMENTS`.
+
+## Security and production checklist
+
+- Set `GRANT_INSIGHTS_ADMIN_PASSWORD`.
+- Put the app behind your organization’s SSO, VPN, or authenticated reverse proxy.
+- Keep sensitive documents off public hosting.
+- Add antivirus/malware scanning if uploads come from untrusted users.
+- Back up the data directory regularly.
+- Restrict the server-path importer to trusted administrators.
+- Keep batches under the configured upload size; use the server-path importer for larger ZIPs.
+- Review low-confidence report matches before broad publication.
+
+The importer validates ZIP paths, expanded size, entry count, and suspicious compression ratios before extraction. Python’s ZIP documentation specifically warns callers to validate filenames to prevent path traversal; the checks are implemented in `importer.py`.
+
+## Scaling beyond SQLite
+
+SQLite is appropriate for a single internal app and modest concurrent use. Move to PostgreSQL when you need multiple app instances, many simultaneous writers, enterprise audit controls, or advanced full-text search. The document folders can later move to S3, Azure Blob Storage, Google Cloud Storage, SharePoint, or another controlled repository.

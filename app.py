@@ -1,19 +1,44 @@
 from __future__ import annotations
 
+import json
+import os
 from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 
-from parser import scan_zip_bytes
+from config import DB_PATH, DOCUMENT_ROOT, ensure_directories
+from database import (
+    get_pdf_candidates,
+    get_project,
+    get_source_files,
+    initialize_database,
+    list_import_items,
+    list_import_runs,
+    list_projects,
+    set_report_override,
+)
+from importer import import_zip_bytes, import_zip_path
 
 st.set_page_config(page_title="Grant Insights Explorer", page_icon="📚", layout="wide")
+ensure_directories()
+initialize_database(DB_PATH)
 
 
-@st.cache_data(show_spinner="Reading project folders and documents...")
-def cached_scan(zip_bytes: bytes) -> tuple[list[dict], str]:
-    records, temp_dir = scan_zip_bytes(zip_bytes)
-    return [r.to_dict() for r in records], temp_dir
+def money_number(value: str) -> float:
+    try:
+        return float(value.replace("$", "").replace(",", "").strip())
+    except (AttributeError, ValueError):
+        return 0.0
+
+
+def human_size(size: int) -> str:
+    amount = float(size)
+    for unit in ("B", "KB", "MB", "GB"):
+        if amount < 1024 or unit == "GB":
+            return f"{amount:.1f} {unit}"
+        amount /= 1024
+    return f"{size} B"
 
 
 def show_field(label: str, value: str) -> None:
@@ -21,179 +46,330 @@ def show_field(label: str, value: str) -> None:
     st.write(value or "—")
 
 
-st.title("Grant Insights Explorer")
-st.caption("Upload one ZIP, search all projects, inspect standardized insights, and open the likely final report.")
+def admin_allowed() -> bool:
+    expected = os.getenv("GRANT_INSIGHTS_ADMIN_PASSWORD", "")
+    if not expected:
+        st.warning("Admin password is not configured. Set `GRANT_INSIGHTS_ADMIN_PASSWORD` before production use.")
+        return True
+    supplied = st.text_input("Admin password", type="password", key="admin-password")
+    return supplied == expected
 
-uploaded = st.file_uploader("Upload the master ZIP", type=["zip"])
-if not uploaded:
-    st.info("The ZIP should contain project folders such as `AVF 18.007 ...`. Nothing is saved permanently in this starter version.")
-    st.stop()
 
-records_raw, extraction_root = cached_scan(uploaded.getvalue())
-# Keep the original dictionaries for nested candidate data.
-records_by_id = {r["project_id"]: r for r in records_raw}
+def project_quality(row: dict) -> str:
+    missing = json.loads(row.get("missing_expected_files_json") or "[]")
+    if row.get("selected_report_path"):
+        missing = [
+            flag for flag in missing
+            if flag not in {"confident final-report PDF", "final-report selection needs review"}
+        ]
+    if missing or (not row.get("selected_report_path") and row.get("final_report_confidence") in {"Low", "None"}):
+        return "Needs review"
+    return "Ready"
 
-if not records_raw:
-    st.error("No project folders were detected. Check that folders or project-note files contain an ID like `AVF 18.007`.")
-    st.stop()
 
-summary_rows = []
-for r in records_raw:
-    summary_rows.append({
-        "Project ID": r["project_id"],
-        "Title": r["title"],
-        "Program": r["program"],
-        "Academic year": r["academic_year"],
-        "Funding": r["funding_amount"],
-        "PI": r["principal_investigator"],
-        "College": r["pi_college"],
-        "CEL": r["cel_classification"],
-        "Confidence": r["confidence"],
-        "Report match": r["final_report_confidence"],
-        "Quality flags": len(r["missing_expected_files"]),
-    })
-df = pd.DataFrame(summary_rows)
+def resolve_document(project: dict, relative_path: str) -> Path:
+    return DOCUMENT_ROOT / project["storage_folder"] / relative_path
 
-with st.sidebar:
-    st.header("Filters")
-    search = st.text_input("Search projects")
-    programs = sorted(x for x in df["Program"].dropna().unique() if x)
-    selected_programs = st.multiselect("Program", programs)
-    report_conf = st.multiselect("Report-match confidence", ["High", "Medium", "Low", "None"])
-    only_flags = st.checkbox("Only projects needing review")
 
-filtered = df.copy()
-if search:
-    needle = search.casefold()
-    matching_ids = []
-    for r in records_raw:
-        blob = "\n".join([
-            str(r.get("project_id", "")), str(r.get("title", "")),
-            str(r.get("summary_text", "")), str(r.get("highlight_text", "")),
-            str(r.get("project_note_text", "")),
-        ]).casefold()
-        if needle in blob:
-            matching_ids.append(r["project_id"])
-    filtered = filtered[filtered["Project ID"].isin(matching_ids)]
-if selected_programs:
-    filtered = filtered[filtered["Program"].isin(selected_programs)]
-if report_conf:
-    filtered = filtered[filtered["Report match"].isin(report_conf)]
-if only_flags:
-    filtered = filtered[filtered["Quality flags"] > 0]
+def display_pdf(path: Path) -> None:
+    if hasattr(st, "pdf"):
+        st.pdf(str(path), height=850)
+    else:
+        st.info("Your Streamlit version does not include the embedded PDF viewer. Use the download button below.")
 
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Projects", len(filtered))
-c2.metric("High-confidence reports", int((filtered["Report match"] == "High").sum()))
-c3.metric("Needs review", int((filtered["Quality flags"] > 0).sum()))
-c4.metric("Total projects loaded", len(df))
 
-st.subheader("Project directory")
-event = st.dataframe(
-    filtered,
-    width="stretch",
-    hide_index=True,
-    on_select="rerun",
-    selection_mode="single-row",
-    column_config={
-        "Quality flags": st.column_config.NumberColumn(help="Missing expected files or uncertain final-report detection"),
-    },
-)
+page = st.sidebar.radio("Navigation", ["Explore projects", "Review queue", "Admin imports", "Import history"])
+st.sidebar.caption(f"Database: {DB_PATH.name}")
 
-selected_id = None
-if event.selection.rows:
-    selected_id = filtered.iloc[event.selection.rows[0]]["Project ID"]
-elif not filtered.empty:
-    selected_id = filtered.iloc[0]["Project ID"]
+if page == "Explore projects":
+    st.title("Grant Insights Explorer")
+    st.caption("Search all imported batches as one collection. Normal viewers never need Python or the original ZIP files.")
 
-if not selected_id:
-    st.warning("No project matches the current filters.")
-    st.stop()
+    projects = list_projects(DB_PATH)
+    if not projects:
+        st.info("No projects have been imported. An administrator can add one or more ZIP batches from **Admin imports**.")
+        st.stop()
 
-record = records_by_id[selected_id]
-st.divider()
-st.header(f"{record['project_id']} — {record['title'] or record['folder_name']}")
-st.caption(f"Automatic final-report detection: {record['final_report_confidence']} confidence · score {record['final_report_score']}")
+    rows = []
+    for project in projects:
+        rows.append(
+            {
+                "Project ID": project["project_id"],
+                "Title": project["title"],
+                "Program": project["program"],
+                "Academic year": project["academic_year"],
+                "Funding": project["funding_amount"],
+                "PI": project["principal_investigator"],
+                "College": project["pi_college"],
+                "Report match": project["final_report_confidence"],
+                "Quality": project_quality(project),
+                "Updated": project["updated_at"],
+            }
+        )
+    frame = pd.DataFrame(rows)
 
-candidate_options = {c["filename"]: c["path"] for c in record["pdf_candidates"]}
-chosen_report_path = record["final_report_path"]
-if candidate_options:
-    automatic_name = Path(record["final_report_path"]).name if record["final_report_path"] else next(iter(candidate_options))
-    chosen_name = st.selectbox(
-        "Final report file",
-        options=list(candidate_options),
-        index=list(candidate_options).index(automatic_name) if automatic_name in candidate_options else 0,
-        help="The automatic choice is preselected. An administrator can select another PDF for this session.",
-        key=f"report-choice-{selected_id}",
+    with st.sidebar:
+        st.header("Filters")
+        search = st.text_input("Search")
+        programs = sorted(value for value in frame["Program"].dropna().unique() if value)
+        selected_programs = st.multiselect("Program", programs)
+        years = sorted(value for value in frame["Academic year"].dropna().unique() if value)
+        selected_years = st.multiselect("Academic year", years)
+        qualities = st.multiselect("Quality", ["Ready", "Needs review"])
+
+    filtered = frame.copy()
+    if search:
+        needle = search.casefold()
+        matched = []
+        for project in projects:
+            blob = "\n".join(
+                str(project.get(key, ""))
+                for key in (
+                    "project_id", "title", "program", "principal_investigator", "pi_college",
+                    "community_partners", "community_need", "community_impact", "publications",
+                    "summary_text", "highlight_text", "project_note_text",
+                )
+            ).casefold()
+            if needle in blob:
+                matched.append(project["project_id"])
+        filtered = filtered[filtered["Project ID"].isin(matched)]
+    if selected_programs:
+        filtered = filtered[filtered["Program"].isin(selected_programs)]
+    if selected_years:
+        filtered = filtered[filtered["Academic year"].isin(selected_years)]
+    if qualities:
+        filtered = filtered[filtered["Quality"].isin(qualities)]
+
+    total_funding = sum(money_number(value) for value in frame["Funding"])
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Projects shown", len(filtered))
+    c2.metric("Total projects", len(frame))
+    c3.metric("Needs review", int((frame["Quality"] == "Needs review").sum()))
+    c4.metric("Recorded funding", f"${total_funding:,.0f}")
+
+    st.subheader("Project directory")
+    event = st.dataframe(
+        filtered,
+        hide_index=True,
+        width="stretch",
+        on_select="rerun",
+        selection_mode="single-row",
     )
-    chosen_report_path = candidate_options[chosen_name]
+    if filtered.empty:
+        st.warning("No projects match the selected filters.")
+        st.stop()
+    selected_id = filtered.iloc[event.selection.rows[0] if event.selection.rows else 0]["Project ID"]
+    project = get_project(DB_PATH, selected_id)
+    assert project is not None
+    files = get_source_files(DB_PATH, selected_id)
+    candidates = get_pdf_candidates(DB_PATH, selected_id)
 
-overview, insights, report_tab, files_tab, quality_tab = st.tabs(
-    ["Overview", "Insights", "Final report", "Files", "Quality review"]
-)
+    st.divider()
+    st.header(f"{project['project_id']} — {project['title'] or project['folder_name']}")
+    st.caption(
+        f"Source batch: {project['source_batch']} · Updated: {project['updated_at']} · "
+        f"Automatic report confidence: {project['final_report_confidence']}"
+    )
 
-with overview:
-    left, right = st.columns(2)
-    with left:
-        show_field("Program", record["program"])
-        show_field("Academic year", record["academic_year"])
-        show_field("Funding", record["funding_amount"])
-        show_field("Principal investigator", record["principal_investigator"])
-        show_field("PI college / department", record["pi_college"])
-    with right:
-        show_field("Community partners", record["community_partners"])
-        show_field("Student involvement", record["student_involvement"])
-        show_field("Students involved", record["number_of_students"])
-        show_field("CEL classification", record["cel_classification"])
-        show_field("Evidence confidence", record["confidence"])
+    overview, insights, evidence, report_tab, files_tab = st.tabs(
+        ["Overview", "Insights", "Source text", "Final report", "Files"]
+    )
+    with overview:
+        left, right = st.columns(2)
+        with left:
+            show_field("Program", project["program"])
+            show_field("Academic year", project["academic_year"])
+            show_field("Funding", project["funding_amount"])
+            show_field("Principal investigator", project["principal_investigator"])
+            show_field("PI college / department", project["pi_college"])
+        with right:
+            show_field("Community partners", project["community_partners"])
+            show_field("Student involvement", project["student_involvement"])
+            show_field("Students involved", project["number_of_students"])
+            show_field("CEL classification", project["cel_classification"])
+            show_field("Evidence confidence", project["confidence"])
 
-with insights:
-    show_field("Community need", record["community_need"])
-    show_field("Community impact", record["community_impact"])
-    show_field("Publications / products", record["publications"])
-    show_field("Brief assessment", record["brief_explanation"])
-    if record["summary_text"]:
-        with st.expander("Full generated summary", expanded=True):
-            st.markdown(record["summary_text"])
-    else:
-        st.info("No summary DOCX was found.")
+    with insights:
+        show_field("Community need", project["community_need"])
+        show_field("Community impact", project["community_impact"])
+        show_field("Publications / products", project["publications"])
+        show_field("Brief assessment", project["brief_explanation"])
+        if project["summary_text"]:
+            with st.expander("Full summary", expanded=True):
+                st.markdown(project["summary_text"])
 
-with report_tab:
-    report_path = chosen_report_path
-    if report_path and Path(report_path).exists():
-        st.write(f"Selected file: **{Path(report_path).name}**")
-        st.pdf(report_path, height=850)
-        with open(report_path, "rb") as fh:
-            st.download_button("Download selected report", fh, file_name=Path(report_path).name, mime="application/pdf")
-    else:
-        st.warning("No likely final report was found.")
+    with evidence:
+        for heading, value in (
+            ("Highlight", project["highlight_text"]),
+            ("Project note", project["project_note_text"]),
+        ):
+            with st.expander(heading, expanded=heading == "Highlight"):
+                st.text(value or "Not available")
 
-with files_tab:
-    for file_path in record["files"]:
-        path = Path(file_path)
-        rel = path.relative_to(extraction_root) if extraction_root in str(path) else path.name
-        c_name, c_action = st.columns([5, 1])
-        c_name.write(f"📄 {rel}")
-        with open(path, "rb") as fh:
-            c_action.download_button("Download", fh.read(), file_name=path.name, key=f"download-{selected_id}-{file_path}")
+    with report_tab:
+        relative_report = project["effective_report_path"]
+        if relative_report:
+            report_path = resolve_document(project, relative_report)
+            if report_path.exists():
+                st.write(f"Selected file: **{report_path.name}**")
+                display_pdf(report_path)
+                st.download_button(
+                    "Download selected report", report_path.read_bytes(), file_name=report_path.name,
+                    mime="application/pdf", key=f"report-download-{selected_id}",
+                )
+            else:
+                st.error("The database points to a report that is missing from document storage.")
+        else:
+            st.warning("No final report has been selected.")
+        if candidates:
+            st.caption("Candidate ranking")
+            candidate_rows = [
+                {
+                    "File": item["filename"],
+                    "Score": item["score"],
+                    "Reasons": "; ".join(item["reasons"]),
+                }
+                for item in candidates
+            ]
+            st.dataframe(
+                pd.DataFrame(candidate_rows),
+                hide_index=True,
+                width="stretch",
+            )
 
-with quality_tab:
-    if record["missing_expected_files"]:
-        st.warning("Needs review: " + ", ".join(record["missing_expected_files"]))
-    else:
-        st.success("All expected files were found and the report match is reasonably confident.")
+    with files_tab:
+        for item in files:
+            path = resolve_document(project, item["relative_path"])
+            c1, c2, c3 = st.columns([5, 1, 1])
+            c1.write(f"📄 {item['relative_path']}")
+            c2.caption(human_size(item["size_bytes"]))
+            if path.exists():
+                c3.download_button(
+                    "Download", path.read_bytes(), file_name=item["filename"],
+                    key=f"source-{selected_id}-{item['id']}",
+                )
 
-    candidates = pd.DataFrame(record["pdf_candidates"])
-    if not candidates.empty:
-        candidates = candidates[["filename", "score", "reasons", "path"]]
-        candidates["reasons"] = candidates["reasons"].apply(lambda x: "\n".join(x))
-        st.subheader("PDF candidate scores")
-        st.dataframe(candidates.drop(columns=["path"]), width="stretch", hide_index=True)
-        st.caption("Production version: add an administrator override and save the chosen report to the index.")
+    st.download_button(
+        "Export filtered index as CSV", filtered.to_csv(index=False).encode("utf-8"),
+        file_name="grant_project_index.csv", mime="text/csv",
+    )
 
-st.download_button(
-    "Export filtered project index as CSV",
-    filtered.to_csv(index=False).encode("utf-8"),
-    file_name="grant_project_index.csv",
-    mime="text/csv",
-)
+elif page == "Review queue":
+    st.title("Review queue")
+    st.caption("Resolve uncertain final-report matches and inspect projects with missing expected files.")
+    if not admin_allowed():
+        st.error("Enter the administrator password to continue.")
+        st.stop()
+
+    projects = [project for project in list_projects(DB_PATH) if project_quality(project) == "Needs review"]
+    if not projects:
+        st.success("No projects currently require review.")
+        st.stop()
+
+    options = {f"{project['project_id']} — {project['title'] or project['folder_name']}": project for project in projects}
+    label = st.selectbox("Project", list(options))
+    project = options[label]
+    missing = json.loads(project["missing_expected_files_json"] or "[]")
+    if missing:
+        st.warning("Flags: " + ", ".join(missing))
+    candidates = get_pdf_candidates(DB_PATH, project["project_id"])
+    if not candidates:
+        st.error("No PDF candidates are available for this project.")
+        st.stop()
+
+    candidate_map = {item["filename"]: item["relative_path"] for item in candidates}
+    current = project["effective_report_path"]
+    current_name = next((name for name, path in candidate_map.items() if path == current), list(candidate_map)[0])
+    selected_name = st.selectbox(
+        "Correct final report", list(candidate_map), index=list(candidate_map).index(current_name)
+    )
+    selected_candidate = next(item for item in candidates if item["filename"] == selected_name)
+    st.write(f"Score: **{selected_candidate['score']}**")
+    st.write("Reasons: " + "; ".join(selected_candidate["reasons"]))
+    preview_path = resolve_document(project, candidate_map[selected_name])
+    if preview_path.exists():
+        display_pdf(preview_path)
+    c1, c2 = st.columns(2)
+    if c1.button("Save override", type="primary"):
+        set_report_override(DB_PATH, project["project_id"], candidate_map[selected_name])
+        st.success("Saved. This file will now be shown as the selected final report.")
+        st.rerun()
+    if c2.button("Return to automatic selection"):
+        set_report_override(DB_PATH, project["project_id"], None)
+        st.success("Manual override removed.")
+        st.rerun()
+
+elif page == "Admin imports":
+    st.title("Admin imports")
+    st.caption("Upload several smaller ZIP batches. They are merged into one database by project ID and fingerprint.")
+    if not admin_allowed():
+        st.error("Enter the administrator password to continue.")
+        st.stop()
+
+    uploads = st.file_uploader(
+        "Select one or more ZIP batches",
+        type=["zip"],
+        accept_multiple_files=True,
+        help="A useful starting point is 25–50 project folders per ZIP.",
+    )
+    if uploads and st.button("Import selected batches", type="primary"):
+        combined_results = []
+        for upload_index, upload in enumerate(uploads, start=1):
+            st.subheader(f"Batch {upload_index}: {upload.name}")
+            progress_bar = st.progress(0.0)
+            status_box = st.empty()
+
+            def progress(current: int, total: int, project_id: str) -> None:
+                progress_bar.progress(current / max(total, 1))
+                status_box.write(f"Processing {current} of {total}: **{project_id}**")
+
+            result = import_zip_bytes(
+                upload.getvalue(), batch_name=upload.name, db_path=DB_PATH,
+                document_root=DOCUMENT_ROOT, progress=progress,
+            )
+            combined_results.append(result)
+            progress_bar.progress(1.0)
+            status_box.write(f"Finished: **{result['status']}**")
+            st.json(result)
+        st.success("Selected batches were processed. Open Explore projects or Review queue to inspect the results.")
+
+    st.divider()
+    st.subheader("Optional server-path import")
+    st.caption("Useful when a batch is too large for browser upload. The ZIP must already be accessible to the server.")
+    local_path = st.text_input("Server ZIP path", placeholder="/data/incoming/batch_04.zip")
+    if st.button("Import server ZIP"):
+        path = Path(local_path).expanduser().resolve()
+        if not path.exists() or path.suffix.lower() != ".zip":
+            st.error("Enter an existing .zip path on the server.")
+        else:
+            progress_bar = st.progress(0.0)
+            status_box = st.empty()
+
+            def local_progress(current: int, total: int, project_id: str) -> None:
+                progress_bar.progress(current / max(total, 1))
+                status_box.write(f"Processing {current} of {total}: **{project_id}**")
+
+            result = import_zip_path(
+                path, batch_name=path.name, db_path=DB_PATH,
+                document_root=DOCUMENT_ROOT, progress=local_progress,
+            )
+            st.json(result)
+
+elif page == "Import history":
+    st.title("Import history")
+    runs = list_import_runs(DB_PATH)
+    if not runs:
+        st.info("No imports have run yet.")
+        st.stop()
+    frame = pd.DataFrame(runs)
+    st.dataframe(
+        frame[[
+            "id", "batch_name", "started_at", "completed_at", "status", "detected_count",
+            "new_count", "updated_count", "skipped_count", "review_count", "error_count",
+        ]],
+        hide_index=True,
+        width="stretch",
+    )
+    run_id = st.selectbox("Show project-level results", [int(row["id"]) for row in runs])
+    items = list_import_items(DB_PATH, run_id)
+    st.dataframe(pd.DataFrame(items), hide_index=True, width="stretch")
