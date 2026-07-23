@@ -143,8 +143,6 @@ if page == "Explore projects":
                 "Funding": project["funding_amount"],
                 "PI": project["principal_investigator"],
                 "College": project["pi_college"],
-                "Report match": project["final_report_confidence"],
-                "Quality": project_quality(project),
                 "Updated": project["updated_at"],
             }
         )
@@ -159,7 +157,6 @@ if page == "Explore projects":
         selected_programs = st.multiselect("Program", programs)
         years = sorted(value for value in frame["Academic year"].dropna().unique() if value)
         selected_years = st.multiselect("Academic year", years)
-        qualities = st.multiselect("Quality", ["Ready", "Needs review"])
 
     filtered = frame.copy()
     if search:
@@ -183,15 +180,12 @@ if page == "Explore projects":
         filtered = filtered[filtered["Program"].isin(selected_programs)]
     if selected_years:
         filtered = filtered[filtered["Academic year"].isin(selected_years)]
-    if qualities:
-        filtered = filtered[filtered["Quality"].isin(qualities)]
 
     total_funding = sum(money_number(value) for value in frame["Funding"])
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3 = st.columns(3)
     c1.metric("Projects shown", len(filtered))
     c2.metric("Total projects", len(frame))
-    c3.metric("Needs review", int((frame["Quality"] == "Needs review").sum()))
-    c4.metric("Recorded funding", f"${total_funding:,.0f}")
+    c3.metric("Recorded funding", f"${total_funding:,.0f}")
 
     st.subheader("Project directory")
     event = st.dataframe(
@@ -208,13 +202,11 @@ if page == "Explore projects":
     project = get_project(DB_PATH, selected_id)
     assert project is not None
     files = get_source_files(DB_PATH, selected_id)
-    candidates = get_pdf_candidates(DB_PATH, selected_id)
 
     st.divider()
     st.header(f"{project['project_id']} — {project['title'] or project['folder_name']}")
     st.caption(
-        f"Source batch: {project['source_batch']} · Updated: {project['updated_at']} · "
-        f"Automatic report confidence: {project['final_report_confidence']}"
+        f"Source batch: {project['source_batch']} · Updated: {project['updated_at']}"
     )
 
     overview, insights, evidence, report_tab, files_tab = st.tabs(
@@ -234,7 +226,6 @@ if page == "Explore projects":
             show_field("Student involvement", project["student_involvement"])
             show_field("Students involved", project["number_of_students"])
             show_field("CEL classification", project["cel_classification"])
-            show_field("Evidence confidence", project["confidence"])
 
     with insights:
         show_field("Community need", project["community_need"])
@@ -268,22 +259,6 @@ if page == "Explore projects":
                 st.error("The database points to a report that is missing from document storage.")
         else:
             st.warning("No final report has been selected.")
-        if candidates:
-            st.caption("Candidate ranking")
-            candidate_rows = [
-                {
-                    "File": item["filename"],
-                    "Score": item["score"],
-                    "Reasons": "; ".join(item["reasons"]),
-                }
-                for item in candidates
-            ]
-            st.dataframe(
-                pd.DataFrame(candidate_rows),
-                hide_index=True,
-                width="stretch",
-            )
-
     with files_tab:
         for item in files:
             path = resolve_document(project, item["relative_path"])
@@ -303,7 +278,7 @@ if page == "Explore projects":
 
 elif page == "Review queue":
     st.title("Review queue")
-    st.caption("Resolve uncertain final-report matches and inspect projects with missing expected files.")
+    st.caption("Select the correct final report for projects that need manual review.")
     if not admin_allowed():
         st.error("Enter the administrator password to continue.")
         st.stop()
@@ -316,9 +291,6 @@ elif page == "Review queue":
     options = {f"{project['project_id']} — {project['title'] or project['folder_name']}": project for project in projects}
     label = st.selectbox("Project", list(options))
     project = options[label]
-    missing = json.loads(project["missing_expected_files_json"] or "[]")
-    if missing:
-        st.warning("Flags: " + ", ".join(missing))
     candidates = get_pdf_candidates(DB_PATH, project["project_id"])
     if not candidates:
         st.error("No PDF candidates are available for this project.")
@@ -330,9 +302,6 @@ elif page == "Review queue":
     selected_name = st.selectbox(
         "Correct final report", list(candidate_map), index=list(candidate_map).index(current_name)
     )
-    selected_candidate = next(item for item in candidates if item["filename"] == selected_name)
-    st.write(f"Score: **{selected_candidate['score']}**")
-    st.write("Reasons: " + "; ".join(selected_candidate["reasons"]))
     preview_path = resolve_document(project, candidate_map[selected_name])
     if preview_path.exists():
         display_pdf(preview_path)

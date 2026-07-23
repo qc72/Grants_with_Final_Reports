@@ -12,7 +12,7 @@ The app installs Streamlit with its PDF extra (`streamlit[pdf]`). If that option
 1. An administrator creates ZIP batches, ideally about 25–50 project folders each.
 2. Each project folder is detected by an ID such as `AVF 18.007`.
 3. The importer reads `summary*.docx`, `*highlight*.txt`, and `*project*note*.txt` case-insensitively.
-4. Every PDF is scored using filename and document-content signals to find the likely final report.
+4. The likely final report is selected automatically; administrators can correct the selection when needed.
 5. A SHA-256 project fingerprint determines whether the project is new, changed, or unchanged.
 6. New projects are inserted, changed projects are updated, and unchanged projects are skipped.
 7. Users browse all batches together through the Streamlit interface.
@@ -101,7 +101,7 @@ Set `GRANT_INSIGHTS_HOME` to move all persistent data. You can separately set `G
 - Back up the data directory regularly.
 - Restrict the server-path importer to trusted administrators.
 - Keep batches under the configured upload size; use the server-path importer for larger ZIPs.
-- Review low-confidence report matches before broad publication.
+- Review uncertain report selections before broad publication.
 
 The importer validates ZIP paths, expanded size, entry count, and suspicious compression ratios before extraction. Python’s ZIP documentation specifically warns callers to validate filenames to prevent path traversal; the checks are implemented in `importer.py`.
 
