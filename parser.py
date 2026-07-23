@@ -25,6 +25,7 @@ class ProjectRecord:
     project_id: str
     folder_name: str
     title: str = ""
+    category: str = ""
     program: str = ""
     academic_year: str = ""
     funding_amount: str = ""
@@ -63,6 +64,38 @@ def canonical_project_id(value: str) -> str | None:
         return None
     return f"{match.group(1).upper()} {match.group(2)}"
 
+
+
+
+def category_from_project_id(project_id: str) -> str:
+    """Return the grant category code, e.g. ``ECG`` from ``ECG 16.003``."""
+    canonical = canonical_project_id(project_id) or project_id.strip().upper()
+    prefix = re.split(r"[ _-]+", canonical, maxsplit=1)[0]
+    return prefix[:3].upper()
+
+
+def normalize_academic_year(value: str) -> str:
+    """Keep the first academic-year range and format it as YYYY-YYYY.
+
+    Examples:
+        2021 – 2022 (activities 2022–23) -> 2021-2022
+        2018–2019 (planning); implementation 2022 -> 2018-2019
+    """
+    if not value:
+        return ""
+    match = re.search(r"(?<!\d)(\d{4})\s*[\-–—]\s*(\d{2}|\d{4})(?!\d)", value)
+    if not match:
+        return value.strip()
+    start = int(match.group(1))
+    end_text = match.group(2)
+    if len(end_text) == 2:
+        century = (start // 100) * 100
+        end = century + int(end_text)
+        if end < start:
+            end += 100
+    else:
+        end = int(end_text)
+    return f"{start:04d}-{end:04d}"
 
 def project_slug(project_id: str) -> str:
     return re.sub(r"[^A-Za-z0-9]+", "_", project_id).strip("_")
@@ -125,7 +158,8 @@ def parse_key_values(text: str) -> dict[str, str]:
 
 ALIASES: dict[str, tuple[str, ...]] = {
     "title": ("title", "project title"),
-    "program": ("program", "category program", "category"),
+    "category": ("category",),
+    "program": ("program", "category program"),
     "academic_year": ("academic year",),
     "funding_amount": ("funding amount", "total funding"),
     "principal_investigator": ("pi project lead", "principal investigator", "project lead"),
@@ -364,6 +398,10 @@ def scan_project(folder: Path, expected_project_id: str | None = None) -> Projec
         field_name: first_value(*value_maps, aliases=aliases)
         for field_name, aliases in ALIASES.items()
     }
+    # Category is intentionally the first three characters of the grant ID.
+    # This is more consistent than free-text program names in source documents.
+    fields["category"] = category_from_project_id(project_id)
+    fields["academic_year"] = normalize_academic_year(fields["academic_year"])
     automatic_report = selected.relative_path if selected else ""
 
     file_rows: list[dict] = []

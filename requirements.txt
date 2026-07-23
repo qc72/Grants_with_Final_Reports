@@ -1,4 +1,4 @@
-streamlit>=1.53,<2
+streamlit[pdf]>=1.53,<2
 pandas>=2.2,<3
 PyMuPDF>=1.26,<2
 python-docx>=1.2,<2

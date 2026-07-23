@@ -2,6 +2,11 @@
 
 A working starter for a large collection of grant-project folders. Administrators upload several smaller ZIP batches; every batch is merged into one persistent database. Nontechnical users open a browser URL and search the combined collection.
 
+
+## PDF viewer dependency
+
+The app installs Streamlit with its PDF extra (`streamlit[pdf]`). If that optional viewer cannot load on a deployment, the app automatically renders the selected PDF one page at a time with PyMuPDF and still provides the original file for download.
+
 ## Included workflow
 
 1. An administrator creates ZIP batches, ideally about 25–50 project folders each.
@@ -103,3 +108,8 @@ The importer validates ZIP paths, expanded size, entry count, and suspicious com
 ## Scaling beyond SQLite
 
 SQLite is appropriate for a single internal app and modest concurrent use. Move to PostgreSQL when you need multiple app instances, many simultaneous writers, enterprise audit controls, or advanced full-text search. The document folders can later move to S3, Azure Blob Storage, Google Cloud Storage, SharePoint, or another controlled repository.
+
+## Metadata normalization
+
+- `Category` is derived from the first three characters of the canonical project ID.
+- Academic years are displayed as `YYYY-YYYY`; parenthetical activity notes are ignored.

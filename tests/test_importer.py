@@ -24,6 +24,8 @@ def test_demo_batch_imports_and_skips_on_second_run() -> None:
         assert first["error"] == 0
         projects = list_projects(db_path)
         assert projects[0]["project_id"] == "AVF 18.007"
+        assert projects[0]["category"] == "AVF"
+        assert projects[0]["academic_year"] == "2017-2018"
         assert projects[0]["final_report_confidence"] == "High"
 
         second = import_zip_path(
@@ -31,3 +33,12 @@ def test_demo_batch_imports_and_skips_on_second_run() -> None:
         )
         assert second["skipped"] == 1
         assert second["new"] == 0
+
+
+def test_year_normalization_and_category_derivation() -> None:
+    from parser import category_from_project_id, normalize_academic_year
+
+    assert category_from_project_id("ECG 21.004") == "ECG"
+    assert normalize_academic_year("2021 – 2022 (activities 2022 – 23)") == "2021-2022"
+    assert normalize_academic_year("2018–2019 (planning); full implementation 2022") == "2018-2019"
+    assert normalize_academic_year("2015 – 2017 (activities 2015 – 17)") == "2015-2017"

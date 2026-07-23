@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
 
-from parser import ProjectRecord
+from parser import ProjectRecord, category_from_project_id, normalize_academic_year
 
 
 def utc_now() -> str:
@@ -35,6 +35,7 @@ def initialize_database(db_path: Path) -> None:
                 project_id TEXT PRIMARY KEY,
                 folder_name TEXT NOT NULL,
                 title TEXT NOT NULL DEFAULT '',
+                category TEXT NOT NULL DEFAULT '',
                 program TEXT NOT NULL DEFAULT '',
                 academic_year TEXT NOT NULL DEFAULT '',
                 funding_amount TEXT NOT NULL DEFAULT '',
@@ -118,6 +119,23 @@ def initialize_database(db_path: Path) -> None:
             CREATE INDEX IF NOT EXISTS idx_import_items_run ON import_items(import_run_id);
             """
         )
+
+        # Lightweight migrations for databases created by earlier app versions.
+        columns = {row["name"] for row in connection.execute("PRAGMA table_info(projects)").fetchall()}
+        if "category" not in columns:
+            connection.execute("ALTER TABLE projects ADD COLUMN category TEXT NOT NULL DEFAULT ''")
+
+        # Backfill category and normalize existing academic-year values so users
+        # do not have to delete and rebuild their database after upgrading.
+        rows = connection.execute("SELECT project_id, category, academic_year FROM projects").fetchall()
+        for row in rows:
+            category = row["category"] or category_from_project_id(row["project_id"])
+            academic_year = normalize_academic_year(row["academic_year"] or "")
+            connection.execute(
+                "UPDATE projects SET category = ?, academic_year = ? WHERE project_id = ?",
+                (category, academic_year, row["project_id"]),
+            )
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_projects_category ON projects(category)")
         connection.commit()
 
 
@@ -201,7 +219,7 @@ def upsert_project(
         connection.execute(
             """
             INSERT INTO projects (
-                project_id, folder_name, title, program, academic_year, funding_amount,
+                project_id, folder_name, title, category, program, academic_year, funding_amount,
                 principal_investigator, pi_college, community_partners, student_involvement,
                 number_of_students, community_need, community_impact, publications,
                 cel_classification, confidence, brief_explanation, final_report_available,
@@ -210,7 +228,7 @@ def upsert_project(
                 missing_expected_files_json, fingerprint, storage_folder, source_batch,
                 created_at, updated_at
             ) VALUES (
-                :project_id, :folder_name, :title, :program, :academic_year, :funding_amount,
+                :project_id, :folder_name, :title, :category, :program, :academic_year, :funding_amount,
                 :principal_investigator, :pi_college, :community_partners, :student_involvement,
                 :number_of_students, :community_need, :community_impact, :publications,
                 :cel_classification, :confidence, :brief_explanation, :final_report_available,
@@ -222,6 +240,7 @@ def upsert_project(
             ON CONFLICT(project_id) DO UPDATE SET
                 folder_name = excluded.folder_name,
                 title = excluded.title,
+                category = excluded.category,
                 program = excluded.program,
                 academic_year = excluded.academic_year,
                 funding_amount = excluded.funding_amount,

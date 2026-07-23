@@ -4,6 +4,8 @@ import json
 import os
 from pathlib import Path
 
+import fitz
+
 import pandas as pd
 import streamlit as st
 
@@ -72,10 +74,49 @@ def resolve_document(project: dict, relative_path: str) -> Path:
 
 
 def display_pdf(path: Path) -> None:
+    """Display a PDF, falling back to page images when Streamlit's PDF extra is unavailable."""
     if hasattr(st, "pdf"):
-        st.pdf(str(path), height=850)
-    else:
-        st.info("Your Streamlit version does not include the embedded PDF viewer. Use the download button below.")
+        try:
+            st.pdf(path.read_bytes(), height=850)
+            return
+        except Exception:
+            # st.pdf exists in recent Streamlit versions even when the optional
+            # streamlit-pdf dependency is not installed. In that case it raises
+            # StreamlitAPIException. The image fallback below keeps the app usable.
+            pass
+
+    try:
+        with fitz.open(path) as document:
+            page_count = document.page_count
+            if page_count < 1:
+                st.warning("This PDF contains no viewable pages.")
+                return
+
+            st.info(
+                "The native PDF viewer is unavailable, so this report is being "
+                "shown one page at a time. The complete PDF is available from "
+                "the download button below."
+            )
+            page_number = st.number_input(
+                "Page",
+                min_value=1,
+                max_value=page_count,
+                value=1,
+                step=1,
+                key=f"pdf-page-{path.as_posix()}",
+            )
+            page = document.load_page(int(page_number) - 1)
+            pixmap = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5), alpha=False)
+            st.image(
+                pixmap.tobytes("png"),
+                caption=f"Page {int(page_number)} of {page_count}",
+                width="stretch",
+            )
+    except Exception as exc:
+        st.warning(
+            "The PDF preview could not be generated. Use the download button "
+            f"below to open the report. Details: {exc}"
+        )
 
 
 page = st.sidebar.radio("Navigation", ["Explore projects", "Review queue", "Admin imports", "Import history"])
@@ -96,6 +137,7 @@ if page == "Explore projects":
             {
                 "Project ID": project["project_id"],
                 "Title": project["title"],
+                "Category": project["category"],
                 "Program": project["program"],
                 "Academic year": project["academic_year"],
                 "Funding": project["funding_amount"],
@@ -111,6 +153,8 @@ if page == "Explore projects":
     with st.sidebar:
         st.header("Filters")
         search = st.text_input("Search")
+        categories = sorted(value for value in frame["Category"].dropna().unique() if value)
+        selected_categories = st.multiselect("Category", categories)
         programs = sorted(value for value in frame["Program"].dropna().unique() if value)
         selected_programs = st.multiselect("Program", programs)
         years = sorted(value for value in frame["Academic year"].dropna().unique() if value)
@@ -125,7 +169,7 @@ if page == "Explore projects":
             blob = "\n".join(
                 str(project.get(key, ""))
                 for key in (
-                    "project_id", "title", "program", "principal_investigator", "pi_college",
+                    "project_id", "title", "category", "program", "principal_investigator", "pi_college",
                     "community_partners", "community_need", "community_impact", "publications",
                     "summary_text", "highlight_text", "project_note_text",
                 )
@@ -133,6 +177,8 @@ if page == "Explore projects":
             if needle in blob:
                 matched.append(project["project_id"])
         filtered = filtered[filtered["Project ID"].isin(matched)]
+    if selected_categories:
+        filtered = filtered[filtered["Category"].isin(selected_categories)]
     if selected_programs:
         filtered = filtered[filtered["Program"].isin(selected_programs)]
     if selected_years:
@@ -177,6 +223,7 @@ if page == "Explore projects":
     with overview:
         left, right = st.columns(2)
         with left:
+            show_field("Category", project["category"])
             show_field("Program", project["program"])
             show_field("Academic year", project["academic_year"])
             show_field("Funding", project["funding_amount"])
